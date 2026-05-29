@@ -158,6 +158,7 @@ function renderTeam(){
         ${u.role==='admin'?'<span class="pill admin">Admin</span>':''}
       </div>
       ${IS_ADMIN?`<div class="row" style="justify-content:flex-end;margin-top:10px">
+        ${u.email?`<button class="btn sm ghost" data-remind-person="${u.id}">✉ Rappel</button>`:''}
         <button class="btn sm ghost" data-edit-person="${u.id}">Modifier</button>
         ${u.id!==ME.id?`<button class="btn sm ghost" data-del-person="${u.id}">Supprimer</button>`:''}
       </div>`:''}
@@ -235,6 +236,38 @@ function buildGantt(ts){
     rows+=`<div class="gantt-row"><div class="gantt-label" title="${esc(t.title)}">${esc(t.title)}</div><div class="gantt-track"><div class="gantt-bar ${cls}" style="left:${off}%;width:${w}%" title="${fmtDate(t.start_date)} → ${fmtDate(t.due_date)}">${t.progress||0}%</div></div></div>`;
   });
   return `<div class="gantt">${head}${rows}</div>`;
+}
+
+/* ====== Rappel par personne ====== */
+async function remindPerson(userId){
+  const u=userById(userId);
+  if(!u||!u.email){alert("Cet utilisateur n'a pas d'adresse email.");return;}
+  let allTasks;
+  try{allTasks=await api('/api/tasks');}catch(e){alert(e.message);return;}
+  const tasks=allTasks.filter(t=>t.assignee_id===userId&&t.status!=='done');
+  if(!tasks.length){alert(`${u.name} n'a aucune tâche active.`);return;}
+  const late=tasks.filter(isLate);
+  const soon=tasks.filter(t=>!isLate(t)&&t.due_date&&daysBetween(today(),t.due_date)>=0&&daysBetween(today(),t.due_date)<=3);
+  const other=tasks.filter(t=>!isLate(t)&&!(t.due_date&&daysBetween(today(),t.due_date)>=0&&daysBetween(today(),t.due_date)<=3));
+  let body=`Bonjour ${u.name.split(' ')[0]},\n\nVoici un récapitulatif de tes tâches actives :\n\n`;
+  if(late.length){
+    body+=`⚠ EN RETARD (${late.length}) :\n`;
+    late.forEach(t=>{const p=projById(t.project_id);body+=`• ${t.title}${p?' ['+p.name+']':''} — Échéance : ${fmtDate(t.due_date)} — Avancement : ${t.progress||0}%\n`;});
+    body+='\n';
+  }
+  if(soon.length){
+    body+=`⏰ ÉCHÉANCES DANS LES 3 JOURS :\n`;
+    soon.forEach(t=>{const p=projById(t.project_id);body+=`• ${t.title}${p?' ['+p.name+']':''} — Échéance : ${fmtDate(t.due_date)}\n`;});
+    body+='\n';
+  }
+  if(other.length){
+    body+=`📋 EN COURS :\n`;
+    other.forEach(t=>{const p=projById(t.project_id);body+=`• ${t.title}${p?' ['+p.name+']':''} — ${STATUS_LABEL[t.status]} — Avancement : ${t.progress||0}%\n`;});
+    body+='\n';
+  }
+  body+=`Merci de tenir ton avancement à jour dans l'application.\n\nCordialement,\n${ME.name}`;
+  const subject=`Récapitulatif de tes tâches — ${document.title}`;
+  window.location.href='mailto:'+encodeURIComponent(u.email)+'?subject='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body);
 }
 
 /* ====== Relance mail ====== */
@@ -568,7 +601,7 @@ function exportPDF(){
 
 /* ====== Événements ====== */
 document.addEventListener('click',function(e){
-  const t=e.target.closest('[data-tab],[data-close],[data-edit-task],[data-del-task],[data-edit-person],[data-del-person],[data-del-abs],[data-remind],[data-ack]');
+  const t=e.target.closest('[data-tab],[data-close],[data-edit-task],[data-del-task],[data-edit-person],[data-del-person],[data-del-abs],[data-remind],[data-ack],[data-remind-person]');
   if(!t)return;
   if(t.hasAttribute('data-tab'))tab(t.dataset.tab);
   else if(t.hasAttribute('data-close'))closeModal(t.dataset.close);
@@ -579,6 +612,7 @@ document.addEventListener('click',function(e){
   else if(t.hasAttribute('data-del-abs'))delAbsence(t.dataset.delAbs);
   else if(t.hasAttribute('data-remind'))remindTask(t.dataset.remind);
   else if(t.hasAttribute('data-ack'))ackAlert(t.dataset.ack);
+  else if(t.hasAttribute('data-remind-person'))remindPerson(parseInt(t.dataset.remindPerson,10));
 });
 document.querySelectorAll('.modal-bg').forEach(m=>m.addEventListener('click',e=>{if(e.target===m && m.id!=='changePwModal')m.classList.remove('show');}));
 
@@ -634,7 +668,7 @@ $('btnSendInvite').addEventListener('click',function(){
   const appName=document.title;
   const subject=`Invitation à ${appName}`;
   const body=`Bonjour ${d.name.split(' ')[0]},\n\nTu as été ajouté(e) à l'application de gestion de projet "${appName}".\n\nPour te connecter :\n${appUrl}\n\nEmail : ${d.email}\nMot de passe temporaire : ${d.password}\n\nLors de ta première connexion, tu devras choisir un nouveau mot de passe personnel.\n\nÀ bientôt !`;
-  window.open('mailto:'+encodeURIComponent(d.email)+'?subject='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body));
+  window.location.href='mailto:'+encodeURIComponent(d.email)+'?subject='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body);
 });
 $('btnChangePw').addEventListener('click',changeMyPassword);
 [$('f_newPw'),$('f_newPw2')].forEach(inp=>inp.addEventListener('keydown',e=>{if(e.key==='Enter')changeMyPassword();}));
