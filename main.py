@@ -15,7 +15,12 @@ import secrets, os, json, io, re
 # ---------------- Config ----------------
 DB_URL = os.environ.get("DATABASE_URL", "sqlite:///./atelier.db")
 SECRET_ADMIN_TOKEN = os.environ.get("ADMIN_BOOTSTRAP_TOKEN", "atelier-setup")
-engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
+if DB_URL.startswith("postgresql://") or DB_URL.startswith("postgres://"):
+    import ssl as _ssl
+    DB_URL = DB_URL.replace("postgresql://", "postgresql+pg8000://", 1).replace("postgres://", "postgresql+pg8000://", 1)
+    engine = create_engine(DB_URL, connect_args={"ssl_context": _ssl.create_default_context()})
+else:
+    engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
 
 # ---------------- Modèles ----------------
 class User(SQLModel, table=True):
