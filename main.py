@@ -52,12 +52,15 @@ class Task(SQLModel, table=True):
     project_id: int = Field(index=True)
     title: str
     description: str = ""
-    assignee_id: Optional[int] = None   # référence à User.id
-    priority: str = "m"          # h / m / l
+    assignee_id: Optional[int] = None
+    priority: str = "m"
     start_date: Optional[date] = None
     due_date: Optional[date] = None
-    status: str = "todo"         # todo / prog / done
+    status: str = "todo"
     progress: int = 0
+    estimated_hours: Optional[float] = None
+    actual_hours: Optional[float] = None
+    milestone_id: Optional[int] = None
 
 class Absence(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -83,6 +86,24 @@ class Comment(SQLModel, table=True):
     user_id: int
     text: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class Tag(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(index=True)
+    name: str
+    color: str = "#e8642f"
+
+class TaskTag(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: int = Field(index=True)
+    tag_id: int = Field(index=True)
+
+class Milestone(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(index=True)
+    name: str
+    due_date: Optional[date] = None
+    description: str = ""
 
 class Setting(SQLModel, table=True):
     key: str = Field(primary_key=True)
@@ -135,14 +156,22 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 def on_startup():
     SQLModel.metadata.create_all(engine)
     with engine.connect() as conn:
-        try:
-            if DB_URL.startswith("sqlite"):
-                conn.execute(text("ALTER TABLE user ADD COLUMN must_change_password BOOLEAN DEFAULT 0 NOT NULL"))
-            else:
-                conn.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT FALSE NOT NULL'))
-            conn.commit()
-        except Exception:
-            pass
+        migrations = [
+            ('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT FALSE NOT NULL',
+             "ALTER TABLE user ADD COLUMN must_change_password BOOLEAN DEFAULT 0 NOT NULL"),
+            ('ALTER TABLE task ADD COLUMN IF NOT EXISTS estimated_hours FLOAT',
+             "ALTER TABLE task ADD COLUMN estimated_hours FLOAT"),
+            ('ALTER TABLE task ADD COLUMN IF NOT EXISTS actual_hours FLOAT',
+             "ALTER TABLE task ADD COLUMN actual_hours FLOAT"),
+            ('ALTER TABLE task ADD COLUMN IF NOT EXISTS milestone_id INTEGER',
+             "ALTER TABLE task ADD COLUMN milestone_id INTEGER"),
+        ]
+        for pg_stmt, sq_stmt in migrations:
+            try:
+                stmt = sq_stmt if DB_URL.startswith("sqlite") else pg_stmt
+                conn.execute(text(stmt)); conn.commit()
+            except Exception:
+                pass
     # créer un admin par défaut si aucun n'existe
     with Session(engine) as s:
         any_admin = s.exec(select(User).where(User.role == "admin")).first()
@@ -307,6 +336,8 @@ def task_dict(t: Task) -> dict:
         "priority": t.priority,
         "start_date": t.start_date.isoformat() if t.start_date else None,
         "due_date": t.due_date.isoformat() if t.due_date else None,
+        "estimated_hours": t.estimated_hours, "actual_hours": t.actual_hours,
+        "milestone_id": t.milestone_id,
         "status": t.status, "progress": t.progress
     }
 
@@ -366,6 +397,9 @@ def update_task(tid: int, data: dict, u: User = Depends(require_user), s: Sessio
     if "due_date" in data: t.due_date = _parse_date(data["due_date"])
     if "assignee_id" in data: t.assignee_id = data["assignee_id"]
     if "project_id" in data and s.get(Project, data["project_id"]): t.project_id = data["project_id"]
+    if "estimated_hours" in data: t.estimated_hours = float(data["estimated_hours"]) if data["estimated_hours"] else None
+    if "actual_hours" in data: t.actual_hours = float(data["actual_hours"]) if data["actual_hours"] else None
+    if "milestone_id" in data: t.milestone_id = data["milestone_id"]
     if t.status == "done": t.progress = 100
     s.add(t); s.commit()
     # toute mise à jour invalide les acquittements liés à cette tâche
@@ -456,6 +490,103 @@ def search_api(q: str = "", u: User = Depends(require_user), s: Session = Depend
     projects = [{"id": p.id, "name": p.name} for p in s.exec(select(Project)).all()
                 if ql in p.name.lower()][:5]
     return {"tasks": tasks, "projects": projects}
+
+# ---------------- API : Tags ----------------
+@app.get("/api/projects/{pid}/tags")
+def list_tags(pid: int, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    return [{"id": t.id, "name": t.name, "color": t.color}
+            for t in s.exec(select(Tag).where(Tag.project_id == pid)).all()]
+
+@app.post("/api/projects/{pid}/tags")
+def create_tag(pid: int, data: dict, u: User = Depends(require_admin), s: Session = Depends(get_session)):
+    name = data.get("name", "").strip()
+    if not name: raise HTTPException(400, "Nom requis")
+    t = Tag(project_id=pid, name=name, color=data.get("color", "#e8642f"))
+    s.add(t); s.commit(); s.refresh(t)
+    return {"id": t.id, "name": t.name, "color": t.color}
+
+@app.delete("/api/tags/{tag_id}")
+def delete_tag(tag_id: int, u: User = Depends(require_admin), s: Session = Depends(get_session)):
+    t = s.get(Tag, tag_id)
+    if t:
+        for tt in s.exec(select(TaskTag).where(TaskTag.tag_id == tag_id)).all(): s.delete(tt)
+        s.delete(t); s.commit()
+    return {"ok": True}
+
+@app.get("/api/tasks/{tid}/tags")
+def get_task_tags(tid: int, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    tts = s.exec(select(TaskTag).where(TaskTag.task_id == tid)).all()
+    tags = [s.get(Tag, tt.tag_id) for tt in tts]
+    return [{"id": t.id, "name": t.name, "color": t.color} for t in tags if t]
+
+@app.post("/api/tasks/{tid}/tags/{tag_id}")
+def add_task_tag(tid: int, tag_id: int, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    t = s.get(Task, tid)
+    if not t or not _can_edit_task(u, t): raise HTTPException(403)
+    if not s.exec(select(TaskTag).where(TaskTag.task_id == tid, TaskTag.tag_id == tag_id)).first():
+        s.add(TaskTag(task_id=tid, tag_id=tag_id)); s.commit()
+    return {"ok": True}
+
+@app.delete("/api/tasks/{tid}/tags/{tag_id}")
+def remove_task_tag(tid: int, tag_id: int, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    tt = s.exec(select(TaskTag).where(TaskTag.task_id == tid, TaskTag.tag_id == tag_id)).first()
+    if tt: s.delete(tt); s.commit()
+    return {"ok": True}
+
+# ---------------- API : Jalons ----------------
+@app.get("/api/projects/{pid}/milestones")
+def list_milestones(pid: int, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    return [{"id": m.id, "name": m.name, "due_date": m.due_date.isoformat() if m.due_date else None, "description": m.description}
+            for m in s.exec(select(Milestone).where(Milestone.project_id == pid).order_by(Milestone.due_date)).all()]
+
+@app.post("/api/projects/{pid}/milestones")
+def create_milestone(pid: int, data: dict, u: User = Depends(require_admin), s: Session = Depends(get_session)):
+    name = data.get("name", "").strip()
+    if not name: raise HTTPException(400, "Nom requis")
+    m = Milestone(project_id=pid, name=name, due_date=_parse_date(data.get("due_date")), description=data.get("description",""))
+    s.add(m); s.commit(); s.refresh(m)
+    return {"id": m.id, "name": m.name, "due_date": m.due_date.isoformat() if m.due_date else None}
+
+@app.put("/api/milestones/{mid}")
+def update_milestone(mid: int, data: dict, u: User = Depends(require_admin), s: Session = Depends(get_session)):
+    m = s.get(Milestone, mid)
+    if not m: raise HTTPException(404)
+    if "name" in data: m.name = data["name"].strip()
+    if "due_date" in data: m.due_date = _parse_date(data["due_date"])
+    if "description" in data: m.description = data["description"]
+    s.add(m); s.commit()
+    return {"ok": True}
+
+@app.delete("/api/milestones/{mid}")
+def delete_milestone(mid: int, u: User = Depends(require_admin), s: Session = Depends(get_session)):
+    m = s.get(Milestone, mid)
+    if m:
+        for t in s.exec(select(Task).where(Task.milestone_id == mid)).all():
+            t.milestone_id = None; s.add(t)
+        s.delete(m); s.commit()
+    return {"ok": True}
+
+# ---------------- API : Templates (E1) ----------------
+@app.get("/api/projects/{pid}/template")
+def export_template(pid: int, u: User = Depends(require_admin), s: Session = Depends(get_session)):
+    p = s.get(Project, pid)
+    if not p: raise HTTPException(404)
+    tasks = [{"title": t.title, "description": t.description, "priority": t.priority,
+              "status": "todo", "progress": 0} for t in s.exec(select(Task).where(Task.project_id == pid)).all()]
+    return {"name": p.name, "description": p.description, "tasks": tasks}
+
+@app.post("/api/projects/from-template")
+def create_from_template(data: dict, u: User = Depends(require_admin), s: Session = Depends(get_session)):
+    name = data.get("name", "").strip()
+    if not name: raise HTTPException(400, "Nom requis")
+    p = Project(name=name, description=data.get("description", ""))
+    s.add(p); s.commit(); s.refresh(p)
+    for td in data.get("tasks", []):
+        t = Task(project_id=p.id, title=td.get("title",""), description=td.get("description",""),
+                 priority=td.get("priority","m"), status="todo", progress=0)
+        s.add(t)
+    s.commit()
+    return {"id": p.id, "name": p.name}
 
 # ---------------- API : Absences ----------------
 @app.get("/api/absences")
