@@ -7,6 +7,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, JSON
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlmodel import SQLModel, Field, Session, create_engine, select
+from sqlalchemy import text
 from typing import Optional, List
 from datetime import date, datetime, timedelta
 from passlib.hash import bcrypt
@@ -33,6 +34,7 @@ class User(SQLModel, table=True):
     password_hash: str
     role: str = "user"   # 'admin' ou 'user'
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    must_change_password: bool = Field(default=False)
 
 class Session_(SQLModel, table=True):
     token: str = Field(primary_key=True)
@@ -118,6 +120,15 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.on_event("startup")
 def on_startup():
     SQLModel.metadata.create_all(engine)
+    with engine.connect() as conn:
+        try:
+            if DB_URL.startswith("sqlite"):
+                conn.execute(text("ALTER TABLE user ADD COLUMN must_change_password BOOLEAN DEFAULT 0 NOT NULL"))
+            else:
+                conn.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT FALSE NOT NULL'))
+            conn.commit()
+        except Exception:
+            pass
     # créer un admin par défaut si aucun n'existe
     with Session(engine) as s:
         any_admin = s.exec(select(User).where(User.role == "admin")).first()
@@ -141,7 +152,8 @@ def home(request: Request, s: Session = Depends(get_session)):
         "request": request, "user": u,
         "app_name": _setting(s, "app_name", "Atelier"),
         "app_logo": _setting(s, "app_logo", ""),
-        "is_admin": u.role == "admin"
+        "is_admin": u.role == "admin",
+        "must_change_password": u.must_change_password
     })
 
 @app.get("/login", response_class=HTMLResponse)
@@ -179,7 +191,7 @@ def logout(request: Request, s: Session = Depends(get_session)):
 # ---------------- API : Users / Team ----------------
 @app.get("/api/me")
 def api_me(u: User = Depends(require_user)):
-    return {"id": u.id, "name": u.name, "email": u.email, "role": u.role}
+    return {"id": u.id, "name": u.name, "email": u.email, "role": u.role, "must_change_password": u.must_change_password}
 
 @app.get("/api/users")
 def list_users(u: User = Depends(require_user), s: Session = Depends(get_session)):
@@ -190,13 +202,13 @@ def list_users(u: User = Depends(require_user), s: Session = Depends(get_session
 def create_user(data: dict, u: User = Depends(require_admin), s: Session = Depends(get_session)):
     email = data.get("email", "").lower().strip()
     name = data.get("name", "").strip()
-    password = data.get("password") or secrets.token_urlsafe(8)
+    password = data.get("password") or "123456"
     if not email or not name:
         raise HTTPException(400, "Nom et email requis")
     if s.exec(select(User).where(User.email == email)).first():
         raise HTTPException(400, "Cet email existe déjà")
     new = User(email=email, name=name, password_hash=bcrypt.hash(password),
-               role=data.get("role", "user"))
+               role=data.get("role", "user"), must_change_password=True)
     s.add(new); s.commit(); s.refresh(new)
     return {"id": new.id, "name": new.name, "email": new.email, "role": new.role,
             "initial_password": password}
@@ -228,6 +240,17 @@ def delete_user(uid: int, u: User = Depends(require_admin), s: Session = Depends
         for sess in s.exec(select(Session_).where(Session_.user_id == uid)).all():
             s.delete(sess)
         s.delete(target); s.commit()
+    return {"ok": True}
+
+@app.put("/api/me/password")
+def change_my_password(data: dict, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    new_pw = data.get("password", "").strip()
+    if len(new_pw) < 6:
+        raise HTTPException(400, "Le mot de passe doit faire au moins 6 caractères")
+    target = s.get(User, u.id)
+    target.password_hash = bcrypt.hash(new_pw)
+    target.must_change_password = False
+    s.add(target); s.commit()
     return {"ok": True}
 
 # ---------------- API : Projects ----------------
