@@ -8,6 +8,8 @@ let state = {
   filterStatus: 'all'
 };
 let pendingDocItems = [];
+let listSort = 'due_date', listDir = 1;
+let currentEditTaskId = null;
 
 /* ====== Helpers ====== */
 const $ = id => document.getElementById(id);
@@ -75,6 +77,8 @@ function renderAll(){
   renderAbsences();
   renderAlerts();
   renderKanban();
+  renderCalendar();
+  renderList();
 }
 
 function renderProjBar(){
@@ -239,6 +243,52 @@ function buildGantt(ts){
   return `<div class="gantt">${head}${rows}</div>`;
 }
 
+/* ====== Calendrier ====== */
+const MONTHS_FR=['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'];
+const DAYS_FR=['Lun','Mar','Mer','Jeu','Ven','Sam','Dim'];
+let calYear=new Date().getFullYear(), calMonth=new Date().getMonth();
+
+function renderCalendar(){
+  const c=$('calContent');if(!c)return;
+  const ts=projTasks().filter(t=>t.due_date);
+  const todayStr=today();
+  const firstDay=new Date(calYear,calMonth,1);
+  const lastDay=new Date(calYear,calMonth+1,0);
+  let startDow=firstDay.getDay();startDow=startDow===0?6:startDow-1;
+  const totalDays=lastDay.getDate();
+  const headers=DAYS_FR.map(d=>`<div class="cal-day-name">${d}</div>`).join('');
+  let cells='';
+  for(let i=0;i<startDow;i++) cells+='<div class="cal-cell other-month"></div>';
+  for(let d=1;d<=totalDays;d++){
+    const dateStr=`${calYear}-${String(calMonth+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const isToday=dateStr===todayStr;
+    const dayTasks=ts.filter(t=>t.due_date===dateStr);
+    const MAX=3;
+    const pills=dayTasks.slice(0,MAX).map(t=>{
+      const late=isLate(t);
+      const color=t.status==='done'?'var(--ok)':late?'var(--bad)':t.priority==='h'?'#d6383f':t.priority==='m'?'var(--warn)':'var(--info)';
+      return `<div class="cal-task-pill" style="background:${color}" data-edit-task="${t.id}" title="${esc(t.title)}">${esc(t.title)}</div>`;
+    }).join('');
+    const more=dayTasks.length>MAX?`<div class="cal-more">+${dayTasks.length-MAX} autres</div>`:'';
+    cells+=`<div class="cal-cell${isToday?' today':''}">
+      <span class="cal-date-num">${d}</span>
+      <div class="cal-tasks">${pills}${more}</div>
+    </div>`;
+  }
+  const rem=(startDow+totalDays)%7;
+  if(rem!==0) for(let i=0;i<7-rem;i++) cells+='<div class="cal-cell other-month"></div>';
+  c.innerHTML=`<div class="cal-nav">
+    <button class="btn sm ghost" id="calPrev">← Précédent</button>
+    <h3 class="cal-title">${MONTHS_FR[calMonth]} ${calYear}</h3>
+    <button class="btn sm ghost" id="calToday">Aujourd'hui</button>
+    <button class="btn sm ghost" id="calNext">Suivant →</button>
+  </div>
+  <div class="cal-grid">${headers}${cells}</div>`;
+  $('calPrev').onclick=()=>{calMonth===0?(calMonth=11,calYear--):calMonth--;renderCalendar();};
+  $('calNext').onclick=()=>{calMonth===11?(calMonth=0,calYear++):calMonth++;renderCalendar();};
+  $('calToday').onclick=()=>{calYear=new Date().getFullYear();calMonth=new Date().getMonth();renderCalendar();};
+}
+
 /* ====== Kanban ====== */
 const KANBAN_COLS=[
   {status:'todo',label:'À faire',cls:'todo'},
@@ -366,7 +416,7 @@ function remindTask(taskId){
 /* ====== Navigation ====== */
 function tab(name){
   document.querySelectorAll('nav .tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
-  ['dash','synth','tasks','team','absence','alerts','kanban'].forEach(s=>{
+  ['dash','synth','tasks','team','absence','alerts','kanban','cal','list'].forEach(s=>{
     const el=$('sec-'+s);
     if(s===name){
       el.classList.remove('hidden');
@@ -426,23 +476,26 @@ function openTask(id){
   openModal('taskModal');
   if(id){
     const t=state.tasks.find(x=>x.id==id);
+    currentEditTaskId=parseInt(id,10);
     $('taskModalTitle').textContent='Modifier la tâche';
     $('f_taskId').value=t.id;$('f_title').value=t.title;$('f_desc').value=t.description||'';
     $('f_assignee').value=t.assignee_id||'';$('f_prio').value=t.priority;
     $('f_start').value=t.start_date||'';$('f_due').value=t.due_date||'';
     $('f_status').value=t.status;$('f_prog').value=t.progress||0;$('f_progVal').textContent=t.progress||0;
-    // Sélecteur projet : visible pour admin seulement en édition
     $('f_taskProjectWrap').classList.toggle('hidden',!IS_ADMIN);
     if(IS_ADMIN) $('f_taskProject').value=t.project_id;
+    loadSubtasks(t.id);
   }else{
+    currentEditTaskId=null;
     $('taskModalTitle').textContent='Nouvelle tâche';
     $('f_taskId').value='';$('f_title').value='';$('f_desc').value='';
     $('f_assignee').value=IS_ADMIN?'':ME.id;
     $('f_prio').value='m';$('f_start').value=today();$('f_due').value='';
     $('f_status').value='todo';$('f_prog').value=0;$('f_progVal').textContent='0';
-    // Sélecteur projet : visible pour tous en création
     $('f_taskProjectWrap').classList.remove('hidden');
     $('f_taskProject').value=state.currentProject||state.projects[0]?.id;
+    $('subtasksWrap').classList.add('hidden');
+    $('commentsWrap').classList.add('hidden');
   }
 }
 async function saveTask(){
@@ -461,16 +514,18 @@ async function saveTask(){
     if(existId){
       if(IS_ADMIN) data.project_id=parseInt($('f_taskProject').value,10);
       await api('/api/tasks/'+existId,{method:'PUT',body:data});
+      toast('Tâche mise à jour');
     }else{
       data.project_id=parseInt($('f_taskProject').value,10);
       await api('/api/tasks',{method:'POST',body:data});
+      toast('Tâche créée');
     }
     closeModal('taskModal');await loadAll();
-  }catch(e){alert(e.message);}
+  }catch(e){toast(e.message,'err');}
 }
 async function delTask(id){
   if(!confirm('Supprimer cette tâche ?'))return;
-  try{await api('/api/tasks/'+id,{method:'DELETE'});await loadAll();}catch(e){alert(e.message);}
+  try{await api('/api/tasks/'+id,{method:'DELETE'});await loadAll();toast('Tâche supprimée','warn');}catch(e){toast(e.message,'err');}
 }
 
 /* ====== Personnes (utilisateurs) ====== */
@@ -508,8 +563,8 @@ async function savePerson(){
         await loadAll();return;
       }
     }
-    closeModal('personModal');await loadAll();
-  }catch(e){alert(e.message);}
+    closeModal('personModal');await loadAll();toast('Profil mis à jour');
+  }catch(e){toast(e.message,'err');}
 }
 async function delPerson(id){
   if(!confirm('Supprimer cette personne ? Ses tâches seront dé-assignées.'))return;
@@ -689,6 +744,163 @@ function exportPDF(){
   w.document.write(html);w.document.close();
 }
 
+/* ====== Toasts ====== */
+function toast(msg, type='ok'){
+  let container=$('toastContainer');
+  if(!container){container=document.createElement('div');container.id='toastContainer';container.className='toast-container';document.body.appendChild(container);}
+  const t=document.createElement('div');t.className=`toast toast-${type}`;t.textContent=msg;
+  container.appendChild(t);
+  requestAnimationFrame(()=>requestAnimationFrame(()=>t.classList.add('show')));
+  setTimeout(()=>{t.classList.remove('show');setTimeout(()=>t.remove(),300);},3500);
+}
+
+/* ====== Vue Liste ====== */
+function renderList(){
+  const head=$('listHead'), body=$('listBody');
+  if(!head||!body)return;
+  const ts=projTasks().slice().sort((a,b)=>{
+    let va=a[listSort]||'', vb=b[listSort]||'';
+    if(listSort==='priority'){const w={h:3,m:2,l:1};va=w[va]||0;vb=w[vb]||0;}
+    return (va>vb?1:va<vb?-1:0)*listDir;
+  });
+  const cols=['title','assignee','priority','status','start_date','due_date','progress'];
+  const labels={title:'Titre',assignee:'Assigné',priority:'Priorité',status:'Statut',start_date:'Début',due_date:'Échéance',progress:'%'};
+  head.innerHTML='<tr>'+cols.map(c=>{
+    const ic=listSort===c?(listDir===1?'↑':'↓'):'';
+    return `<th data-sort="${c}">${labels[c]} <span class="sort-ic">${ic}</span></th>`;
+  }).join('')+'<th></th></tr>';
+  if(!ts.length){body.innerHTML='<tr><td colspan="8" class="empty">Aucune tâche dans ce projet.</td></tr>';return;}
+  body.innerHTML=ts.map(t=>{
+    const late=isLate(t);
+    const u=userById(t.assignee_id);
+    const prioOpts=['h','m','l'].map(v=>`<option value="${v}"${t.priority===v?' selected':''}>${PRIO_LABEL[v]}</option>`).join('');
+    const statOpts=['todo','prog','done'].map(v=>`<option value="${v}"${t.status===v?' selected':''}>${STATUS_LABEL[v]}</option>`).join('');
+    return `<tr class="${late?'late-row':''}">
+      <td><span data-edit-task="${t.id}" style="cursor:pointer;font-weight:600">${esc(t.title)}</span></td>
+      <td>${esc(u?u.name:'—')}</td>
+      <td><select class="list-inline-sel" data-list-prio="${t.id}">${prioOpts}</select></td>
+      <td><select class="list-inline-sel" data-list-status="${t.id}">${statOpts}</select></td>
+      <td>${fmtDate(t.start_date)}</td>
+      <td>${fmtDate(t.due_date)}</td>
+      <td>${t.progress||0}%</td>
+      <td><button class="x" data-del-task="${t.id}">✕</button></td>
+    </tr>`;
+  }).join('');
+  head.querySelectorAll('th[data-sort]').forEach(th=>th.addEventListener('click',()=>sortList(th.dataset.sort)));
+  body.querySelectorAll('[data-list-status]').forEach(sel=>sel.addEventListener('change',async function(){
+    try{await api('/api/tasks/'+this.dataset.listStatus,{method:'PUT',body:{status:this.value}});
+    const t=state.tasks.find(x=>x.id==this.dataset.listStatus);if(t)t.status=this.value;
+    renderList();renderStats();renderDash();renderKanban();toast('Statut mis à jour');}catch(e){toast(e.message,'err');}
+  }));
+  body.querySelectorAll('[data-list-prio]').forEach(sel=>sel.addEventListener('change',async function(){
+    try{await api('/api/tasks/'+this.dataset.listPrio,{method:'PUT',body:{priority:this.value}});
+    const t=state.tasks.find(x=>x.id==this.dataset.listPrio);if(t)t.priority=this.value;
+    renderList();toast('Priorité mise à jour');}catch(e){toast(e.message,'err');}
+  }));
+}
+function sortList(field){
+  if(listSort===field)listDir*=-1; else{listSort=field;listDir=1;}
+  renderList();
+}
+function exportCSV(){
+  const ts=projTasks();if(!ts.length){toast('Aucune tâche à exporter','warn');return;}
+  const proj=projById(state.currentProject);
+  const header='Titre,Responsable,Priorité,Statut,Début,Échéance,Avancement';
+  const rows=ts.map(t=>[
+    `"${(t.title||'').replace(/"/g,'""')}"`,
+    `"${userName(t.assignee_id)}"`,
+    PRIO_LABEL[t.priority],
+    STATUS_LABEL[t.status],
+    t.start_date||'',
+    t.due_date||'',
+    (t.progress||0)+'%'
+  ].join(','));
+  const csv='﻿'+header+'\n'+rows.join('\n');
+  const a=document.createElement('a');
+  a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);
+  a.download=`taches-${(proj?.name||'projet').replace(/\s+/g,'-')}.csv`;
+  a.click();
+  toast('Export CSV téléchargé');
+}
+
+/* ====== Recherche (Ctrl+K) ====== */
+function openSearch(){
+  $('searchModal').classList.add('show');
+  $('searchInput').value='';
+  $('searchResults').innerHTML='<div class="search-empty">Commence à taper…</div>';
+  setTimeout(()=>$('searchInput').focus(),50);
+}
+async function doSearch(q){
+  if(!q||q.length<2){$('searchResults').innerHTML='<div class="search-empty">Commence à taper…</div>';return;}
+  try{
+    const r=await api('/api/search?q='+encodeURIComponent(q));
+    let html='';
+    if(r.projects.length){
+      html+=`<div class="search-group"><div class="search-group-label">Projets</div>`;
+      html+=r.projects.map(p=>`<div class="search-item" data-search-proj="${p.id}"><span class="search-item-icon">📁</span>${esc(p.name)}</div>`).join('');
+      html+='</div>';
+    }
+    if(r.tasks.length){
+      html+=`<div class="search-group"><div class="search-group-label">Tâches</div>`;
+      html+=r.tasks.map(t=>`<div class="search-item" data-edit-task="${t.id}"><span class="search-item-icon">${t.status==='done'?'✅':'📌'}</span><div><div>${esc(t.title)}</div><div style="font-size:11px;color:var(--mut)">${esc(projById(t.project_id)?.name||'')}</div></div></div>`).join('');
+      html+='</div>';
+    }
+    if(!html)html='<div class="search-empty">Aucun résultat</div>';
+    $('searchResults').innerHTML=html;
+    $('searchResults').querySelectorAll('[data-search-proj]').forEach(el=>el.addEventListener('click',()=>{
+      const pid=parseInt(el.dataset.searchProj,10);
+      $('projSelect').value=pid;$('projSelect').dispatchEvent(new Event('change'));
+      closeModal('searchModal');
+    }));
+    $('searchResults').querySelectorAll('[data-edit-task]').forEach(el=>el.addEventListener('click',()=>{
+      closeModal('searchModal');openTask(el.dataset.editTask);
+    }));
+  }catch(e){$('searchResults').innerHTML=`<div class="search-empty">Erreur : ${esc(e.message)}</div>`;}
+}
+
+/* ====== Sous-tâches ====== */
+async function loadSubtasks(taskId){
+  if(!taskId){$('subtasksWrap').classList.add('hidden');return;}
+  $('subtasksWrap').classList.remove('hidden');
+  $('commentsWrap').classList.remove('hidden');
+  const [subtasks,comments]=await Promise.all([
+    api('/api/tasks/'+taskId+'/subtasks'),
+    api('/api/tasks/'+taskId+'/comments')
+  ]);
+  renderSubtaskList(subtasks, taskId);
+  renderCommentList(comments);
+}
+function renderSubtaskList(subtasks, taskId){
+  const done=subtasks.filter(s=>s.done).length, total=subtasks.length;
+  $('subtaskList').innerHTML=(total?`<div class="subtask-progress">${done}/${total} complétées</div>`:'')
+    +subtasks.map(st=>`<div class="subtask-item" data-stid="${st.id}">
+      <input type="checkbox" ${st.done?'checked':''} data-st-toggle="${st.id}">
+      <span class="st-title${st.done?' done':''}">${esc(st.title)}</span>
+      <button class="x" data-st-del="${st.id}">✕</button>
+    </div>`).join('');
+  $('subtaskList').querySelectorAll('[data-st-toggle]').forEach(cb=>cb.addEventListener('change',async function(){
+    try{await api('/api/subtasks/'+this.dataset.stToggle,{method:'PUT',body:{done:this.checked}});
+    const sts=await api('/api/tasks/'+taskId+'/subtasks');renderSubtaskList(sts,taskId);}
+    catch(e){toast(e.message,'err');}
+  }));
+  $('subtaskList').querySelectorAll('[data-st-del]').forEach(btn=>btn.addEventListener('click',async function(){
+    try{await api('/api/subtasks/'+this.dataset.stDel,{method:'DELETE'});
+    const sts=await api('/api/tasks/'+taskId+'/subtasks');renderSubtaskList(sts,taskId);}
+    catch(e){toast(e.message,'err');}
+  }));
+}
+function renderCommentList(comments){
+  $('commentList').innerHTML=comments.length?comments.map(c=>`<div class="comment-item">
+    <div class="comment-header"><span class="comment-author">${esc(c.author)}</span><div class="row" style="gap:8px"><span class="comment-date">${fmtDate(c.created_at.slice(0,10))}</span>${(ME.role==='admin'||c.user_id===ME.id)?`<button class="x" style="font-size:12px" data-del-comment="${c.id}">✕</button>`:''}</div></div>
+    <div class="comment-text">${esc(c.text)}</div>
+  </div>`).join(''):'<div style="color:var(--mut);font-size:13px;font-style:italic">Aucun commentaire.</div>';
+  if(currentEditTaskId) $('commentList').querySelectorAll('[data-del-comment]').forEach(btn=>btn.addEventListener('click',async function(){
+    try{await api('/api/comments/'+this.dataset.delComment,{method:'DELETE'});
+    const cs=await api('/api/tasks/'+currentEditTaskId+'/comments');renderCommentList(cs);}
+    catch(e){toast(e.message,'err');}
+  }));
+}
+
 /* ====== Événements ====== */
 document.addEventListener('click',function(e){
   const t=e.target.closest('[data-tab],[data-close],[data-edit-task],[data-del-task],[data-edit-person],[data-del-person],[data-del-abs],[data-remind],[data-ack],[data-remind-person]');
@@ -735,6 +947,45 @@ $('btnAckAll').addEventListener('click',ackAll);
 $('btnExportPDF').addEventListener('click',exportPDF);
 $('btnImportDoc').addEventListener('click',()=>$('docInput').click());
 $('docInput').addEventListener('change',function(e){const f=e.target.files[0];if(f)startDocImport(f);e.target.value='';});
+
+// Boutons liste
+if($('btnExportCSV')) $('btnExportCSV').addEventListener('click',exportCSV);
+if($('btnAddTaskList')) $('btnAddTaskList').addEventListener('click',()=>openTask());
+
+// Recherche Ctrl+K
+document.addEventListener('keydown',function(e){
+  if((e.ctrlKey||e.metaKey)&&e.key==='k'){e.preventDefault();openSearch();}
+  if(e.key==='Escape' && $('searchModal').classList.contains('show'))closeModal('searchModal');
+});
+if($('searchInput')) $('searchInput').addEventListener('input',function(){doSearch(this.value.trim());});
+$('searchModal').addEventListener('click',e=>{if(e.target===$('searchModal'))closeModal('searchModal');});
+
+// Sous-tâches
+if($('btnAddSubtask')) $('btnAddSubtask').addEventListener('click',async function(){
+  const title=$('f_subtaskTitle').value.trim();
+  if(!title||!currentEditTaskId)return;
+  try{
+    await api('/api/tasks/'+currentEditTaskId+'/subtasks',{method:'POST',body:{title}});
+    $('f_subtaskTitle').value='';
+    const sts=await api('/api/tasks/'+currentEditTaskId+'/subtasks');
+    renderSubtaskList(sts,currentEditTaskId);
+    toast('Sous-tâche ajoutée');
+  }catch(e){toast(e.message,'err');}
+});
+if($('f_subtaskTitle')) $('f_subtaskTitle').addEventListener('keydown',e=>{if(e.key==='Enter' && $('btnAddSubtask')) $('btnAddSubtask').click();});
+
+// Commentaires
+if($('btnAddComment')) $('btnAddComment').addEventListener('click',async function(){
+  const text=$('f_commentText').value.trim();
+  if(!text||!currentEditTaskId)return;
+  try{
+    await api('/api/tasks/'+currentEditTaskId+'/comments',{method:'POST',body:{text}});
+    $('f_commentText').value='';
+    const cs=await api('/api/tasks/'+currentEditTaskId+'/comments');
+    renderCommentList(cs);
+    toast('Commentaire ajouté');
+  }catch(e){toast(e.message,'err');}
+});
 
 // avatar utilisateur dans la barre du haut
 $('meAva').style.background=avaColor(ME.id);
