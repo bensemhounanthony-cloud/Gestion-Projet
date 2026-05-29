@@ -10,6 +10,9 @@ let state = {
 let pendingDocItems = [];
 let listSort = 'due_date', listDir = 1;
 let currentEditTaskId = null;
+let activeFilters = {assignee: '', priority: '', status: 'all'};
+let projectTags = [], projectMilestones = [], currentTaskTags = [];
+let chartStatus = null, chartAssignee = null;
 
 /* ====== Helpers ====== */
 const $ = id => document.getElementById(id);
@@ -61,7 +64,9 @@ async function loadAll(){
     if(state.currentProject){
       state.tasks = await api('/api/tasks');
       state.alerts = await api('/api/alerts');
+      await loadProjectTags();
     }
+    renderFilterAssigneeOpts();
     renderAll();
   }catch(e){alert('Erreur de chargement : '+e.message);}
 }
@@ -79,6 +84,9 @@ function renderAll(){
   renderKanban();
   renderCalendar();
   renderList();
+  renderCapacity();
+  renderNotifBell();
+  renderDashCharts();
 }
 
 function renderProjBar(){
@@ -121,6 +129,14 @@ function renderStats(){
 
 function renderDash(){
   const ts=projTasks();
+  // Ajoute les canvas Chart.js si absent
+  if(!$('chartStatus')){
+    const chartsDiv=document.createElement('div');
+    chartsDiv.className='grid';chartsDiv.style='grid-template-columns:1fr 1fr;gap:16px;margin-bottom:18px';
+    chartsDiv.innerHTML='<div class="panel"><div class="sec-h" style="margin-bottom:8px"><h2 style="font-size:15px">Répartition des statuts</h2></div><div class="chart-wrap"><canvas id="chartStatus"></canvas></div></div><div class="panel"><div class="sec-h" style="margin-bottom:8px"><h2 style="font-size:15px">Charge par membre</h2></div><div class="chart-wrap"><canvas id="chartAssignee"></canvas></div></div>';
+    $('sec-dash').insertBefore(chartsDiv,$('statRow').nextSibling);
+    renderDashCharts();
+  } else { renderDashCharts(); }
   $('dashProgress').innerHTML = ts.length===0 ? '<div class="empty">Aucune tâche dans ce projet.</div>' :
     ts.map(t=>`<div style="margin-bottom:14px"><div class="row" style="justify-content:space-between"><strong>${esc(t.title)}</strong><span class="meta">${t.progress||0}%${isLate(t)?' · <span style="color:var(--bad)">retard</span>':''}</span></div><div class="progress"><i style="width:${t.progress||0}%"></i></div></div>`).join('');
   const al = state.alerts;
@@ -128,7 +144,7 @@ function renderDash(){
 }
 
 function renderTasks(){
-  const list=projTasks().filter(t=>state.filterStatus==='all'||t.status===state.filterStatus);
+  const list=filteredTasks().filter(t=>state.filterStatus==='all'||t.status===state.filterStatus);
   const el=$('taskList');
   if(list.length===0){el.innerHTML='<div class="empty">Aucune tâche. Clique sur « Nouvelle tâche ».</div>';return;}
   el.innerHTML = list.map((t,i)=>{
@@ -299,7 +315,7 @@ const KANBAN_COLS=[
 function renderKanban(){
   const board=$('kanbanBoard');
   if(!board)return;
-  const ts=projTasks();
+  const ts=filteredTasks();
   board.innerHTML='<div class="kanban-board">'+KANBAN_COLS.map(col=>{
     const tasks=ts.filter(t=>t.status===col.status);
     const cards=tasks.length?tasks.map(t=>{
@@ -416,7 +432,7 @@ function remindTask(taskId){
 /* ====== Navigation ====== */
 function tab(name){
   document.querySelectorAll('nav .tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
-  ['dash','synth','tasks','team','absence','alerts','kanban','cal','list'].forEach(s=>{
+  ['dash','synth','tasks','team','absence','alerts','kanban','cal','list','capacity'].forEach(s=>{
     const el=$('sec-'+s);
     if(s===name){
       el.classList.remove('hidden');
@@ -484,9 +500,15 @@ function openTask(id){
     $('f_status').value=t.status;$('f_prog').value=t.progress||0;$('f_progVal').textContent=t.progress||0;
     $('f_taskProjectWrap').classList.toggle('hidden',!IS_ADMIN);
     if(IS_ADMIN) $('f_taskProject').value=t.project_id;
+    $('f_estHours').value=t.estimated_hours||'';
+    $('f_actHours').value=t.actual_hours||'';
+    fillMilestoneSelect();$('f_milestone').value=t.milestone_id||'';
     loadSubtasks(t.id);
+    loadTaskTags(t.id);
   }else{
     currentEditTaskId=null;
+    $('f_estHours').value='';$('f_actHours').value='';
+    currentTaskTags=[];fillMilestoneSelect();fillMilestoneSelect();
     $('taskModalTitle').textContent='Nouvelle tâche';
     $('f_taskId').value='';$('f_title').value='';$('f_desc').value='';
     $('f_assignee').value=IS_ADMIN?'':ME.id;
@@ -507,7 +529,10 @@ async function saveTask(){
     assignee_id: $('f_assignee').value ? parseInt($('f_assignee').value,10) : null,
     priority:$('f_prio').value,
     start_date:$('f_start').value||null,due_date:$('f_due').value||null,
-    status:$('f_status').value,progress:prog
+    status:$('f_status').value,progress:prog,
+    estimated_hours:$('f_estHours').value?parseFloat($('f_estHours').value):null,
+    actual_hours:$('f_actHours').value?parseFloat($('f_actHours').value):null,
+    milestone_id:$('f_milestone').value?parseInt($('f_milestone').value):null
   };
   const existId=$('f_taskId').value;
   try{
@@ -744,6 +769,135 @@ function exportPDF(){
   w.document.write(html);w.document.close();
 }
 
+/* ====== Filtres avancés (B3) ====== */
+function filteredTasks(){
+  return projTasks().filter(t=>{
+    if(activeFilters.assignee && t.assignee_id!=parseInt(activeFilters.assignee)) return false;
+    if(activeFilters.priority && t.priority!==activeFilters.priority) return false;
+    if(activeFilters.status && activeFilters.status!=='all' && t.status!==activeFilters.status) return false;
+    return true;
+  });
+}
+function renderFilterAssigneeOpts(){
+  const sel=$('filterAssignee');if(!sel)return;
+  const cur=sel.value;
+  sel.innerHTML='<option value="">👤 Tous</option>'+state.users.map(u=>`<option value="${u.id}">${esc(u.name)}</option>`).join('');
+  sel.value=cur;
+}
+function applyFilters(){
+  const fa=$('filterAssignee'), fp=$('filterPriority'), fs=$('filterStatus');
+  if(fa) activeFilters.assignee=fa.value;
+  if(fp) activeFilters.priority=fp.value;
+  if(fs) activeFilters.status=fs.value;
+  renderTasks();renderKanban();renderList();
+}
+
+/* ====== Cloche notifications (A3) ====== */
+function renderNotifBell(){
+  const count=state.alerts.length;
+  const badge=$('notifCount');
+  if(badge){badge.textContent=count;badge.classList.toggle('hidden',count===0);}
+}
+function toggleNotifDropdown(){
+  const dd=$('notifDropdown');
+  dd.classList.toggle('hidden');
+  if(!dd.classList.contains('hidden')){
+    dd.innerHTML=state.alerts.length?state.alerts.slice(0,8).map(a=>`
+      <div class="notif-item alert ${a.type}" data-ack="${a.key}">
+        <div class="notif-title">${esc(a.title)}</div>
+        <div class="notif-msg">${esc(a.msg)}</div>
+      </div>`).join(''):'<div class="notif-empty">🎉 Aucune alerte active</div>';
+    dd.querySelectorAll('[data-ack]').forEach(el=>el.addEventListener('click',()=>{ackAlert(el.dataset.ack);dd.classList.add('hidden');}));
+  }
+}
+document.addEventListener('click',e=>{
+  if(!e.target.closest('#btnNotif') && !e.target.closest('#notifDropdown'))
+    $('notifDropdown')?.classList.add('hidden');
+},{capture:true});
+
+/* ====== Vue Capacité (D2) ====== */
+function renderCapacity(){
+  const el=$('capacityBoard');if(!el)return;
+  if(!state.users.length){el.innerHTML='<div class="empty">Aucun membre.</div>';return;}
+  const MAX_TASKS=8;
+  el.innerHTML='<div class="grid cards">'+state.users.map(u=>{
+    const active=state.tasks.filter(t=>t.assignee_id===u.id&&t.status!=='done');
+    const late=active.filter(isLate).length;
+    const soon=active.filter(t=>!isLate(t)&&t.due_date&&daysBetween(today(),t.due_date)<=3&&daysBetween(today(),t.due_date)>=0).length;
+    const pct=Math.min(100,Math.round(active.length/MAX_TASKS*100));
+    const cls=pct>=100?'over':pct>=75?'warn':'ok';
+    const absent=isAbsentNow(u.id);
+    const upcomingByWeek={};
+    active.forEach(t=>{if(!t.due_date)return;const w=t.due_date.slice(0,7);upcomingByWeek[w]=(upcomingByWeek[w]||0)+1;});
+    const weekRows=Object.entries(upcomingByWeek).sort().slice(0,4)
+      .map(([m,n])=>`<span class="capacity-week">${m} : ${n} tâche(s)</span>`).join('');
+    return `<div class="capacity-card">
+      <div class="capacity-header">
+        <div class="ava" style="background:${avaColor(u.id)}">${initials(u.name)}</div>
+        <div style="flex:1">
+          <div style="font-weight:700;font-size:15px">${esc(u.name)}${absent?'<span class="pill absent" style="margin-left:8px">Absent</span>':''}</div>
+          <div style="font-size:12px;color:var(--mut)">${active.length} tâche(s) active(s) · ${late?'<span style="color:var(--bad)">'+late+' en retard</span>':soon?'<span style="color:var(--warn)">'+soon+' à venir</span>':'<span style="color:var(--ok)">Tout OK</span>'}</div>
+        </div>
+      </div>
+      <div class="row" style="align-items:center;gap:10px;margin-bottom:6px">
+        <div class="capacity-bar-wrap"><div class="capacity-bar-fill ${cls}" style="width:${pct}%"></div></div>
+        <span style="font-size:12px;font-weight:700;color:${cls==='over'?'var(--bad)':cls==='warn'?'var(--warn)':'var(--ok)'}">${pct}%</span>
+      </div>
+      ${weekRows?`<div class="row" style="gap:8px;flex-wrap:wrap;margin-top:6px">${weekRows}</div>`:''}
+    </div>`;
+  }).join('')+'</div>';
+}
+
+/* ====== Dashboard Charts (D1) ====== */
+function renderDashCharts(){
+  if(typeof Chart==='undefined') return;
+  const ts=projTasks();
+  // Graphique statuts
+  const canvStatus=$('chartStatus');
+  if(canvStatus){
+    if(chartStatus){chartStatus.destroy();}
+    const counts={todo:ts.filter(t=>t.status==='todo').length,prog:ts.filter(t=>t.status==='prog').length,done:ts.filter(t=>t.status==='done').length};
+    chartStatus=new Chart(canvStatus,{type:'doughnut',data:{labels:['À faire','En cours','Terminé'],datasets:[{data:[counts.todo,counts.prog,counts.done],backgroundColor:['#8a8478','#2f7fd6','#2e9e5b'],borderWidth:0}]},options:{plugins:{legend:{position:'bottom',labels:{boxWidth:12,font:{size:11}}}},cutout:'70%',responsive:true,maintainAspectRatio:false}});
+  }
+  // Graphique charge par personne
+  const canvAssign=$('chartAssignee');
+  if(canvAssign && state.users.length){
+    if(chartAssignee){chartAssignee.destroy();}
+    const labels=state.users.map(u=>u.name.split(' ')[0]);
+    const dataActive=state.users.map(u=>state.tasks.filter(t=>t.assignee_id===u.id&&t.status!=='done').length);
+    const dataLate=state.users.map(u=>state.tasks.filter(t=>t.assignee_id===u.id&&isLate(t)).length);
+    chartAssignee=new Chart(canvAssign,{type:'bar',data:{labels,datasets:[{label:'Actives',data:dataActive,backgroundColor:'rgba(47,127,214,.7)',borderRadius:4},{label:'En retard',data:dataLate,backgroundColor:'rgba(214,56,63,.7)',borderRadius:4}]},options:{plugins:{legend:{position:'bottom',labels:{boxWidth:12,font:{size:11}}}},scales:{y:{beginAtZero:true,ticks:{stepSize:1}}},responsive:true,maintainAspectRatio:false}});
+  }
+}
+
+/* ====== Tags (B1) ====== */
+async function loadProjectTags(){
+  if(!state.currentProject) return;
+  try{projectTags=await api('/api/projects/'+state.currentProject+'/tags');}catch{projectTags=[];}
+  try{projectMilestones=await api('/api/projects/'+state.currentProject+'/milestones');}catch{projectMilestones=[];}
+}
+async function loadTaskTags(taskId){
+  try{currentTaskTags=await api('/api/tasks/'+taskId+'/tags');}catch{currentTaskTags=[];}
+  renderTaskTagsUI();
+}
+function renderTaskTagsUI(){
+  const el=$('taskTagsDisplay');if(!el)return;
+  el.innerHTML=currentTaskTags.map(t=>`<span class="tag-pill" style="background:${t.color}" data-remove-tag="${t.id}">${esc(t.name)} <span class="tag-x">✕</span></span>`).join('');
+  el.querySelectorAll('[data-remove-tag]').forEach(pill=>pill.addEventListener('click',async()=>{
+    if(!currentEditTaskId)return;
+    await api('/api/tasks/'+currentEditTaskId+'/tags/'+pill.dataset.removeTag,{method:'DELETE'});
+    currentTaskTags=currentTaskTags.filter(t=>t.id!=pill.dataset.removeTag);
+    renderTaskTagsUI();
+  }));
+  const sel=$('f_tagAdd');if(!sel)return;
+  const usedIds=new Set(currentTaskTags.map(t=>t.id));
+  sel.innerHTML='<option value="">+ Ajouter une étiquette</option>'+projectTags.filter(t=>!usedIds.has(t.id)).map(t=>`<option value="${t.id}" style="color:${t.color}">${t.name}</option>`).join('');
+}
+function fillMilestoneSelect(){
+  const sel=$('f_milestone');if(!sel)return;
+  sel.innerHTML='<option value="">— Aucun —</option>'+projectMilestones.map(m=>`<option value="${m.id}">${esc(m.name)}${m.due_date?' ('+fmtDate(m.due_date)+')':''}</option>`).join('');
+}
+
 /* ====== Toasts ====== */
 function toast(msg, type='ok'){
   let container=$('toastContainer');
@@ -951,6 +1105,28 @@ $('docInput').addEventListener('change',function(e){const f=e.target.files[0];if
 // Boutons liste
 if($('btnExportCSV')) $('btnExportCSV').addEventListener('click',exportCSV);
 if($('btnAddTaskList')) $('btnAddTaskList').addEventListener('click',()=>openTask());
+
+// Cloche notifications
+if($('btnNotif')) $('btnNotif').addEventListener('click',toggleNotifDropdown);
+
+// Filtres
+if($('filterAssignee')) $('filterAssignee').addEventListener('change',applyFilters);
+if($('filterPriority')) $('filterPriority').addEventListener('change',applyFilters);
+if($('filterStatus')) $('filterStatus').addEventListener('change',applyFilters);
+
+// Tags — ajout via le select
+if($('f_tagAdd')) $('f_tagAdd').addEventListener('change',async function(){
+  if(!this.value||!currentEditTaskId)return;
+  try{
+    await api('/api/tasks/'+currentEditTaskId+'/tags/'+this.value,{method:'POST',body:{}});
+    const added=projectTags.find(t=>t.id==this.value);
+    if(added) currentTaskTags.push(added);
+    renderTaskTagsUI();toast('Étiquette ajoutée');
+  }catch(e){toast(e.message,'err');}
+  this.value='';
+});
+
+// Boutons liste
 
 // Recherche Ctrl+K
 document.addEventListener('keydown',function(e){
