@@ -7,7 +7,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, JSON
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlmodel import SQLModel, Field, Session, create_engine, select
-from sqlalchemy import text
+from sqlalchemy import text, update as sa_update
 from typing import Optional, List
 from datetime import date, datetime, timedelta
 from passlib.hash import bcrypt
@@ -22,7 +22,7 @@ if DB_URL.startswith("postgresql://") or DB_URL.startswith("postgres://"):
     _ssl_ctx = _ssl.create_default_context()
     _ssl_ctx.check_hostname = False
     _ssl_ctx.verify_mode = _ssl.CERT_NONE
-    engine = create_engine(DB_URL, connect_args={"ssl_context": _ssl_ctx})
+    engine = create_engine(DB_URL, connect_args={"ssl_context": _ssl_ctx}, pool_pre_ping=True)
 else:
     engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
 
@@ -260,12 +260,24 @@ def create_user(data: dict, u: User = Depends(require_admin), s: Session = Depen
 def update_user(uid: int, data: dict, u: User = Depends(require_admin), s: Session = Depends(get_session)):
     target = s.get(User, uid)
     if not target:
-        raise HTTPException(404)
-    if "name" in data: target.name = data["name"].strip()
-    if "email" in data: target.email = data["email"].lower().strip()
-    if "role" in data and data["role"] in ("admin", "user"): target.role = data["role"]
-    if data.get("password"): target.password_hash = bcrypt.hash(data["password"])
-    s.add(target); s.commit()
+        raise HTTPException(404, "Utilisateur introuvable")
+    updates = {}
+    if "name" in data and data["name"].strip():
+        updates["name"] = data["name"].strip()
+    if "email" in data:
+        new_email = data["email"].lower().strip()
+        if new_email != target.email:
+            conflict = s.exec(select(User).where(User.email == new_email)).first()
+            if conflict:
+                raise HTTPException(400, "Cet email est déjà utilisé par un autre compte")
+        updates["email"] = new_email
+    if "role" in data and data["role"] in ("admin", "user"):
+        updates["role"] = data["role"]
+    if data.get("password"):
+        updates["password_hash"] = bcrypt.hash(data["password"])
+    if updates:
+        s.execute(sa_update(User).where(User.id == uid).values(**updates))
+        s.commit()
     return {"ok": True}
 
 @app.delete("/api/users/{uid}")
