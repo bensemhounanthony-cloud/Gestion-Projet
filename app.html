@@ -113,6 +113,7 @@
 <div class="modal-bg" id="taskModal"><div class="modal">
   <h2 id="taskModalTitle">Nouvelle tâche</h2>
   <input type="hidden" id="f_taskId">
+  <div class="field" id="f_taskProjectWrap"><label>Projet</label><select id="f_taskProject"></select></div>
   <div class="field"><label>Titre</label><input id="f_title" placeholder="Ex : Maquette page d'accueil"></div>
   <div class="field"><label>Description</label><textarea id="f_desc" rows="2"></textarea></div>
   <div class="row" style="gap:13px">
@@ -178,6 +179,19 @@ window.CURRENT_USER = {
   must_change_password: {{ 'true' if must_change_password else 'false' }}
 };
 </script>
+<div class="modal-bg" id="inviteModal"><div class="modal">
+  <h2>✅ Compte créé</h2>
+  <p class="meta" style="margin-bottom:16px">Identifiants à transmettre à la personne :</p>
+  <div class="panel" style="margin-bottom:16px;background:var(--panel2)">
+    <div style="margin-bottom:8px"><strong>Email :</strong> <span id="inv_email"></span></div>
+    <div><strong>Mot de passe temporaire :</strong> <span id="inv_pw" style="font-family:monospace;font-weight:700">123456</span></div>
+  </div>
+  <div class="row" style="justify-content:flex-end;gap:10px">
+    <button class="btn ghost" data-close="inviteModal">Fermer</button>
+    <button class="btn primary" id="btnSendInvite">✉ Envoyer l'invitation</button>
+  </div>
+</div></div>
+
 <div class="modal-bg" id="changePwModal"><div class="modal">
   <h2>🔒 Nouveau mot de passe requis</h2>
   <p class="meta" style="margin-bottom:16px">C'est ta première connexion. Choisis un mot de passe personnel avant d'accéder à l'application.</p>

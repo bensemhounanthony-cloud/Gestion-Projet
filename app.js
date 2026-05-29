@@ -258,6 +258,8 @@ function tab(name){
 function openModal(id){fillSelects();$(id).classList.add('show');}
 function closeModal(id){$(id).classList.remove('show');}
 function fillSelects(){
+  // Projets pour la tâche
+  $('f_taskProject').innerHTML=state.projects.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('');
   // Pour la tâche : assignés = utilisateurs
   $('f_assignee').innerHTML='<option value="">— Non assigné —</option>'+state.users.map(u=>`<option value="${u.id}">${esc(u.name)}</option>`).join('');
   $('f_aPerson').innerHTML=state.users.map(u=>`<option value="${u.id}">${esc(u.name)}</option>`).join('');
@@ -297,7 +299,7 @@ async function delProject(){
 
 /* ====== Tâches ====== */
 function openTask(id){
-  if(!state.currentProject){alert('Sélectionne d\'abord un projet.');return;}
+  if(!state.projects.length){alert('Crée d\'abord un projet.');return;}
   openModal('taskModal');
   if(id){
     const t=state.tasks.find(x=>x.id==id);
@@ -306,12 +308,18 @@ function openTask(id){
     $('f_assignee').value=t.assignee_id||'';$('f_prio').value=t.priority;
     $('f_start').value=t.start_date||'';$('f_due').value=t.due_date||'';
     $('f_status').value=t.status;$('f_prog').value=t.progress||0;$('f_progVal').textContent=t.progress||0;
+    // Sélecteur projet : visible pour admin seulement en édition
+    $('f_taskProjectWrap').classList.toggle('hidden',!IS_ADMIN);
+    if(IS_ADMIN) $('f_taskProject').value=t.project_id;
   }else{
     $('taskModalTitle').textContent='Nouvelle tâche';
     $('f_taskId').value='';$('f_title').value='';$('f_desc').value='';
     $('f_assignee').value=IS_ADMIN?'':ME.id;
     $('f_prio').value='m';$('f_start').value=today();$('f_due').value='';
     $('f_status').value='todo';$('f_prog').value=0;$('f_progVal').textContent='0';
+    // Sélecteur projet : visible pour tous en création
+    $('f_taskProjectWrap').classList.remove('hidden');
+    $('f_taskProject').value=state.currentProject||state.projects[0]?.id;
   }
 }
 async function saveTask(){
@@ -327,8 +335,13 @@ async function saveTask(){
   };
   const existId=$('f_taskId').value;
   try{
-    if(existId){await api('/api/tasks/'+existId,{method:'PUT',body:data});}
-    else{data.project_id=parseInt(state.currentProject,10);await api('/api/tasks',{method:'POST',body:data});}
+    if(existId){
+      if(IS_ADMIN) data.project_id=parseInt($('f_taskProject').value,10);
+      await api('/api/tasks/'+existId,{method:'PUT',body:data});
+    }else{
+      data.project_id=parseInt($('f_taskProject').value,10);
+      await api('/api/tasks',{method:'POST',body:data});
+    }
     closeModal('taskModal');await loadAll();
   }catch(e){alert(e.message);}
 }
@@ -364,7 +377,12 @@ async function savePerson(){
     else{
       const r=await api('/api/users',{method:'POST',body:data});
       if(r.initial_password){
-        alert(`Compte créé pour ${r.name}.\n\nIdentifiants à transmettre :\nEmail : ${r.email}\nMot de passe : ${r.initial_password}`);
+        closeModal('personModal');
+        $('inv_email').textContent=r.email;
+        $('inv_pw').textContent=r.initial_password;
+        window._inviteData={name:r.name,email:r.email,password:r.initial_password};
+        openModal('inviteModal');
+        await loadAll();return;
       }
     }
     closeModal('personModal');await loadAll();
@@ -610,6 +628,14 @@ async function changeMyPassword(){
     ME.must_change_password=false;
   }catch(e){err.textContent=e.message;err.style.display='';}
 }
+$('btnSendInvite').addEventListener('click',function(){
+  const d=window._inviteData;if(!d)return;
+  const appUrl=window.location.origin;
+  const appName=document.title;
+  const subject=`Invitation à ${appName}`;
+  const body=`Bonjour ${d.name.split(' ')[0]},\n\nTu as été ajouté(e) à l'application de gestion de projet "${appName}".\n\nPour te connecter :\n${appUrl}\n\nEmail : ${d.email}\nMot de passe temporaire : ${d.password}\n\nLors de ta première connexion, tu devras choisir un nouveau mot de passe personnel.\n\nÀ bientôt !`;
+  window.open('mailto:'+encodeURIComponent(d.email)+'?subject='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body));
+});
 $('btnChangePw').addEventListener('click',changeMyPassword);
 [$('f_newPw'),$('f_newPw2')].forEach(inp=>inp.addEventListener('keydown',e=>{if(e.key==='Enter')changeMyPassword();}));
 if(ME.must_change_password) $('changePwModal').classList.add('show');
