@@ -24,6 +24,8 @@
       <span>{{ user.name }}</span>
       {% if is_admin %}<span class="role-tag">ADMIN</span>{% endif %}
     </div>
+    <button class="btn ghost" id="btnNotif" title="Notifications">🔔 <span id="notifCount" class="badge hidden">0</span></button>
+    <div class="notif-dropdown hidden" id="notifDropdown"></div>
     <button class="btn ghost" id="btnImportDoc">📄 Importer un document</button>
     <input type="file" id="docInput" accept=".pdf,.docx,.txt,.md" class="hidden">
     <a href="/logout" class="btn ghost">Déconnexion</a>
@@ -38,7 +40,16 @@
   <div class="tab" data-tab="absence">Absences</div>
   <div class="tab" data-tab="alerts">Alertes <span class="badge hidden" id="alertBadge">0</span></div>
   <div class="tab" data-tab="kanban">⠿ Kanban</div>
+  <div class="tab" data-tab="cal">📅 Calendrier</div>
+  <div class="tab" data-tab="list">📋 Liste</div>
+  <div class="tab" data-tab="capacity">💪 Capacité</div>
 </nav>
+
+<div class="filter-bar hidden" id="filterBar">
+  <span style="font-size:12px;font-weight:700;color:var(--mut)">FILTRES :</span>
+  <div id="filterChips" class="row" style="gap:6px;flex-wrap:wrap"></div>
+  <button class="btn sm ghost" id="btnClearFilters">✕ Effacer</button>
+</div>
 
 <div class="projbar">
   <label>Projet :</label>
@@ -71,12 +82,9 @@
     <div class="sec-h">
       <h2>Tâches du projet</h2>
       <div class="row">
-        <select class="btn sm" id="filterStatus">
-          <option value="all">Tous les statuts</option>
-          <option value="todo">À faire</option>
-          <option value="prog">En cours</option>
-          <option value="done">Terminé</option>
-        </select>
+        <select class="btn sm ghost" id="filterAssignee"><option value="">👤 Tous</option></select>
+        <select class="btn sm ghost" id="filterPriority"><option value="">⚡ Priorité</option><option value="h">Haute</option><option value="m">Moyenne</option><option value="l">Basse</option></select>
+        <select class="btn sm" id="filterStatus"><option value="all">Tous statuts</option><option value="todo">À faire</option><option value="prog">En cours</option><option value="done">Terminé</option></select>
         <button class="btn primary" id="btnAddTask">+ Nouvelle tâche</button>
       </div>
     </div>
@@ -109,6 +117,29 @@
     <div class="grid" id="alertList" style="gap:11px"></div>
   </section>
 
+  <section id="sec-capacity" class="hidden">
+    <div class="sec-h"><h2>Capacité de l'équipe</h2></div>
+    <div id="capacityBoard"></div>
+  </section>
+
+  <section id="sec-list" class="hidden">
+    <div class="sec-h">
+      <h2>Liste des tâches</h2>
+      <div class="row">
+        <button class="btn sm ghost" id="btnExportCSV">⬇ CSV</button>
+        <button class="btn primary" id="btnAddTaskList">+ Nouvelle tâche</button>
+      </div>
+    </div>
+    <div class="panel" style="overflow:auto;padding:0"><table id="listTable">
+      <thead id="listHead"></thead>
+      <tbody id="listBody"></tbody>
+    </table></div>
+  </section>
+
+  <section id="sec-cal" class="hidden">
+    <div id="calContent"></div>
+  </section>
+
   <section id="sec-kanban" class="hidden">
     <div class="sec-h">
       <h2>Kanban</h2>
@@ -139,6 +170,31 @@
       <select id="f_status"><option value="todo">À faire</option><option value="prog">En cours</option><option value="done">Terminé</option></select></div>
     <div class="field" style="flex:1;min-width:140px"><label>Avancement : <span id="f_progVal">0</span>%</label><input type="range" id="f_prog" min="0" max="100" value="0"></div>
   </div>
+  <div class="row" style="gap:13px">
+    <div class="field" style="flex:1"><label>Estimation (h)</label><input type="number" id="f_estHours" placeholder="0" min="0" step="0.5"></div>
+    <div class="field" style="flex:1"><label>Temps réel (h)</label><input type="number" id="f_actHours" placeholder="0" min="0" step="0.5"></div>
+    <div class="field" style="flex:1"><label>Jalon</label><select id="f_milestone"><option value="">— Aucun —</option></select></div>
+  </div>
+  <div class="field" id="tagsField"><label>Étiquettes</label>
+    <div id="taskTagsDisplay" class="row" style="flex-wrap:wrap;gap:6px;margin-bottom:6px"></div>
+    <div class="row" style="gap:6px"><select id="f_tagAdd" class="btn sm"><option value="">+ Ajouter une étiquette</option></select></div>
+  </div>
+  <div id="subtasksWrap" class="hidden"><div class="field">
+    <label>Sous-tâches</label>
+    <div id="subtaskList" style="margin-bottom:8px"></div>
+    <div class="row" style="gap:6px">
+      <input id="f_subtaskTitle" placeholder="Ajouter une sous-tâche..." style="flex:1;background:var(--panel2);border:1.5px solid var(--line);padding:8px 11px;border-radius:var(--r-sm);outline:none;font-size:13px">
+      <button class="btn sm" id="btnAddSubtask" type="button">+</button>
+    </div>
+  </div></div>
+  <div id="commentsWrap" class="hidden"><div class="field">
+    <label>Commentaires</label>
+    <div id="commentList" style="margin-bottom:8px;max-height:200px;overflow:auto"></div>
+    <div class="row" style="gap:6px">
+      <input id="f_commentText" placeholder="Ajouter un commentaire..." style="flex:1;background:var(--panel2);border:1.5px solid var(--line);padding:8px 11px;border-radius:var(--r-sm);outline:none;font-size:13px">
+      <button class="btn sm" id="btnAddComment" type="button">Envoyer</button>
+    </div>
+  </div></div>
   <div class="row" style="justify-content:flex-end;margin-top:8px">
     <button class="btn ghost" data-close="taskModal">Annuler</button>
     <button class="btn primary" id="btnSaveTask">Enregistrer</button>
@@ -188,6 +244,11 @@ window.CURRENT_USER = {
   must_change_password: {{ 'true' if must_change_password else 'false' }}
 };
 </script>
+<div class="modal-bg" id="searchModal"><div class="modal" style="width:min(600px,100%)">
+  <div class="search-bar"><span>🔍</span><input id="searchInput" type="text" placeholder="Rechercher tâche, projet… (Esc pour fermer)" autocomplete="off"></div>
+  <div id="searchResults"></div>
+</div></div>
+
 <div class="modal-bg" id="inviteModal"><div class="modal">
   <h2>✅ Compte créé</h2>
   <p class="meta" style="margin-bottom:16px">Identifiants à transmettre à la personne :</p>
@@ -212,6 +273,7 @@ window.CURRENT_USER = {
   </div>
 </div></div>
 <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
