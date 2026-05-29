@@ -557,7 +557,8 @@ async function delTask(id){
 function openPerson(id){
   openModal('personModal');
   if(id){
-    const u=userById(id);
+    const u=userById(parseInt(id,10));
+    if(!u){closeModal('personModal');toast('Utilisateur introuvable, rechargez la page.','err');return;}
     $('personModalTitle').textContent='Modifier '+u.name;
     $('f_personId').value=u.id;$('f_name').value=u.name;$('f_email').value=u.email;
     $('f_role').value=u.role;$('f_password').value='';
