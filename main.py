@@ -18,7 +18,10 @@ SECRET_ADMIN_TOKEN = os.environ.get("ADMIN_BOOTSTRAP_TOKEN", "atelier-setup")
 if DB_URL.startswith("postgresql://") or DB_URL.startswith("postgres://"):
     import ssl as _ssl
     DB_URL = DB_URL.replace("postgresql://", "postgresql+pg8000://", 1).replace("postgres://", "postgresql+pg8000://", 1)
-    engine = create_engine(DB_URL, connect_args={"ssl_context": _ssl.create_default_context()})
+    _ssl_ctx = _ssl.create_default_context()
+    _ssl_ctx.check_hostname = False
+    _ssl_ctx.verify_mode = _ssl.CERT_NONE
+    engine = create_engine(DB_URL, connect_args={"ssl_context": _ssl_ctx})
 else:
     engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
 
