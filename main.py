@@ -1,0 +1,466 @@
+"""
+Atelier - Gestion de projet collaborative
+Backend FastAPI + SQLite
+"""
+from fastapi import FastAPI, Depends, HTTPException, Request, Form, UploadFile, File, Cookie, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from sqlmodel import SQLModel, Field, Session, create_engine, select
+from typing import Optional, List
+from datetime import date, datetime, timedelta
+from passlib.hash import bcrypt
+import secrets, os, json, io, re
+
+# ---------------- Config ----------------
+DB_URL = os.environ.get("DATABASE_URL", "sqlite:///./atelier.db")
+SECRET_ADMIN_TOKEN = os.environ.get("ADMIN_BOOTSTRAP_TOKEN", "atelier-setup")
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
+
+# ---------------- Modèles ----------------
+class User(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(unique=True, index=True)
+    name: str
+    password_hash: str
+    role: str = "user"   # 'admin' ou 'user'
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class Session_(SQLModel, table=True):
+    token: str = Field(primary_key=True)
+    user_id: int
+    expires: datetime
+
+class Project(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    description: str = ""
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class Task(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(index=True)
+    title: str
+    description: str = ""
+    assignee_id: Optional[int] = None   # référence à User.id
+    priority: str = "m"          # h / m / l
+    start_date: Optional[date] = None
+    due_date: Optional[date] = None
+    status: str = "todo"         # todo / prog / done
+    progress: int = 0
+
+class Absence(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int
+    kind: str
+    from_date: date
+    to_date: date
+
+class AckedAlert(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    alert_key: str = Field(index=True)  # ex: "late:42" — task_id concerné
+
+class Setting(SQLModel, table=True):
+    key: str = Field(primary_key=True)
+    value: str
+
+# ---------------- Helpers ----------------
+def get_session():
+    with Session(engine) as s:
+        yield s
+
+def _setting(s: Session, key: str, default: str = "") -> str:
+    r = s.get(Setting, key)
+    return r.value if r else default
+
+def _set_setting(s: Session, key: str, value: str):
+    r = s.get(Setting, key)
+    if r:
+        r.value = value
+    else:
+        r = Setting(key=key, value=value)
+    s.add(r); s.commit()
+
+def get_current_user(request: Request, s: Session = Depends(get_session)) -> Optional[User]:
+    token = request.cookies.get("atelier_session")
+    if not token:
+        return None
+    sess = s.get(Session_, token)
+    if not sess or sess.expires < datetime.utcnow():
+        return None
+    return s.get(User, sess.user_id)
+
+def require_user(request: Request, s: Session = Depends(get_session)) -> User:
+    u = get_current_user(request, s)
+    if not u:
+        raise HTTPException(401, "Non connecté")
+    return u
+
+def require_admin(request: Request, s: Session = Depends(get_session)) -> User:
+    u = require_user(request, s)
+    if u.role != "admin":
+        raise HTTPException(403, "Accès réservé aux administrateurs")
+    return u
+
+# ---------------- App ----------------
+app = FastAPI(title="Atelier")
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.on_event("startup")
+def on_startup():
+    SQLModel.metadata.create_all(engine)
+    # créer un admin par défaut si aucun n'existe
+    with Session(engine) as s:
+        any_admin = s.exec(select(User).where(User.role == "admin")).first()
+        if not any_admin:
+            admin_email = os.environ.get("ADMIN_EMAIL", "admin@atelier.local")
+            admin_password = os.environ.get("ADMIN_PASSWORD", "admin")
+            u = User(email=admin_email, name="Administrateur",
+                     password_hash=bcrypt.hash(admin_password), role="admin")
+            s.add(u); s.commit()
+            print(f"[Atelier] Admin créé : {admin_email} / {admin_password}")
+        if not _setting(s, "app_name"):
+            _set_setting(s, "app_name", "Atelier")
+
+# ---------------- Pages ----------------
+@app.get("/", response_class=HTMLResponse)
+def home(request: Request, s: Session = Depends(get_session)):
+    u = get_current_user(request, s)
+    if not u:
+        return RedirectResponse("/login")
+    return templates.TemplateResponse("app.html", {
+        "request": request, "user": u,
+        "app_name": _setting(s, "app_name", "Atelier"),
+        "app_logo": _setting(s, "app_logo", ""),
+        "is_admin": u.role == "admin"
+    })
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request, s: Session = Depends(get_session)):
+    return templates.TemplateResponse("login.html", {
+        "request": request,
+        "app_name": _setting(s, "app_name", "Atelier"),
+        "app_logo": _setting(s, "app_logo", "")
+    })
+
+@app.post("/login")
+def login(response: Response, email: str = Form(...), password: str = Form(...),
+          s: Session = Depends(get_session)):
+    user = s.exec(select(User).where(User.email == email.lower().strip())).first()
+    if not user or not bcrypt.verify(password, user.password_hash):
+        return RedirectResponse("/login?error=1", status_code=303)
+    token = secrets.token_urlsafe(32)
+    s.add(Session_(token=token, user_id=user.id, expires=datetime.utcnow() + timedelta(days=30)))
+    s.commit()
+    resp = RedirectResponse("/", status_code=303)
+    resp.set_cookie("atelier_session", token, httponly=True, samesite="lax", max_age=30*86400)
+    return resp
+
+@app.get("/logout")
+def logout(request: Request, s: Session = Depends(get_session)):
+    token = request.cookies.get("atelier_session")
+    if token:
+        sess = s.get(Session_, token)
+        if sess:
+            s.delete(sess); s.commit()
+    resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie("atelier_session")
+    return resp
+
+# ---------------- API : Users / Team ----------------
+@app.get("/api/me")
+def api_me(u: User = Depends(require_user)):
+    return {"id": u.id, "name": u.name, "email": u.email, "role": u.role}
+
+@app.get("/api/users")
+def list_users(u: User = Depends(require_user), s: Session = Depends(get_session)):
+    return [{"id": x.id, "name": x.name, "email": x.email, "role": x.role}
+            for x in s.exec(select(User).order_by(User.name)).all()]
+
+@app.post("/api/users")
+def create_user(data: dict, u: User = Depends(require_admin), s: Session = Depends(get_session)):
+    email = data.get("email", "").lower().strip()
+    name = data.get("name", "").strip()
+    password = data.get("password") or secrets.token_urlsafe(8)
+    if not email or not name:
+        raise HTTPException(400, "Nom et email requis")
+    if s.exec(select(User).where(User.email == email)).first():
+        raise HTTPException(400, "Cet email existe déjà")
+    new = User(email=email, name=name, password_hash=bcrypt.hash(password),
+               role=data.get("role", "user"))
+    s.add(new); s.commit(); s.refresh(new)
+    return {"id": new.id, "name": new.name, "email": new.email, "role": new.role,
+            "initial_password": password}
+
+@app.put("/api/users/{uid}")
+def update_user(uid: int, data: dict, u: User = Depends(require_admin), s: Session = Depends(get_session)):
+    target = s.get(User, uid)
+    if not target:
+        raise HTTPException(404)
+    if "name" in data: target.name = data["name"].strip()
+    if "email" in data: target.email = data["email"].lower().strip()
+    if "role" in data and data["role"] in ("admin", "user"): target.role = data["role"]
+    if data.get("password"): target.password_hash = bcrypt.hash(data["password"])
+    s.add(target); s.commit()
+    return {"ok": True}
+
+@app.delete("/api/users/{uid}")
+def delete_user(uid: int, u: User = Depends(require_admin), s: Session = Depends(get_session)):
+    if uid == u.id:
+        raise HTTPException(400, "Tu ne peux pas te supprimer toi-même")
+    target = s.get(User, uid)
+    if target:
+        # dé-assigner ses tâches
+        for t in s.exec(select(Task).where(Task.assignee_id == uid)).all():
+            t.assignee_id = None; s.add(t)
+        # supprimer ses absences et sessions
+        for a in s.exec(select(Absence).where(Absence.user_id == uid)).all():
+            s.delete(a)
+        for sess in s.exec(select(Session_).where(Session_.user_id == uid)).all():
+            s.delete(sess)
+        s.delete(target); s.commit()
+    return {"ok": True}
+
+# ---------------- API : Projects ----------------
+@app.get("/api/projects")
+def list_projects(u: User = Depends(require_user), s: Session = Depends(get_session)):
+    return [{"id": p.id, "name": p.name, "description": p.description}
+            for p in s.exec(select(Project).order_by(Project.name)).all()]
+
+@app.post("/api/projects")
+def create_project(data: dict, u: User = Depends(require_admin), s: Session = Depends(get_session)):
+    name = data.get("name", "").strip()
+    if not name: raise HTTPException(400, "Nom requis")
+    p = Project(name=name, description=data.get("description", "").strip())
+    s.add(p); s.commit(); s.refresh(p)
+    return {"id": p.id, "name": p.name, "description": p.description}
+
+@app.put("/api/projects/{pid}")
+def update_project(pid: int, data: dict, u: User = Depends(require_admin), s: Session = Depends(get_session)):
+    p = s.get(Project, pid)
+    if not p: raise HTTPException(404)
+    if "name" in data: p.name = data["name"].strip()
+    if "description" in data: p.description = data["description"].strip()
+    s.add(p); s.commit()
+    return {"ok": True}
+
+@app.delete("/api/projects/{pid}")
+def delete_project(pid: int, u: User = Depends(require_admin), s: Session = Depends(get_session)):
+    p = s.get(Project, pid)
+    if p:
+        for t in s.exec(select(Task).where(Task.project_id == pid)).all():
+            s.delete(t)
+        s.delete(p); s.commit()
+    return {"ok": True}
+
+# ---------------- API : Tasks ----------------
+def task_dict(t: Task) -> dict:
+    return {
+        "id": t.id, "project_id": t.project_id, "title": t.title,
+        "description": t.description, "assignee_id": t.assignee_id,
+        "priority": t.priority,
+        "start_date": t.start_date.isoformat() if t.start_date else None,
+        "due_date": t.due_date.isoformat() if t.due_date else None,
+        "status": t.status, "progress": t.progress
+    }
+
+@app.get("/api/tasks")
+def list_tasks(project_id: Optional[int] = None,
+               u: User = Depends(require_user), s: Session = Depends(get_session)):
+    q = select(Task)
+    if project_id is not None:
+        q = q.where(Task.project_id == project_id)
+    return [task_dict(t) for t in s.exec(q).all()]
+
+def _parse_date(v):
+    if not v: return None
+    return date.fromisoformat(v) if isinstance(v, str) else v
+
+@app.post("/api/tasks")
+def create_task(data: dict, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    # Tout utilisateur peut créer une tâche (assignée à lui-même par défaut)
+    title = data.get("title", "").strip()
+    if not title: raise HTTPException(400, "Titre requis")
+    pid = data.get("project_id")
+    if not pid or not s.get(Project, pid):
+        raise HTTPException(400, "Projet invalide")
+    assignee = data.get("assignee_id")
+    # Si non admin : assignation forcée à soi-même
+    if u.role != "admin":
+        assignee = u.id
+    t = Task(
+        project_id=pid, title=title,
+        description=data.get("description", ""),
+        assignee_id=assignee, priority=data.get("priority", "m"),
+        start_date=_parse_date(data.get("start_date")),
+        due_date=_parse_date(data.get("due_date")),
+        status=data.get("status", "todo"),
+        progress=int(data.get("progress", 0))
+    )
+    s.add(t); s.commit(); s.refresh(t)
+    return task_dict(t)
+
+def _can_edit_task(u: User, t: Task) -> bool:
+    return u.role == "admin" or t.assignee_id == u.id
+
+@app.put("/api/tasks/{tid}")
+def update_task(tid: int, data: dict, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    t = s.get(Task, tid)
+    if not t: raise HTTPException(404)
+    if not _can_edit_task(u, t):
+        raise HTTPException(403, "Tu ne peux modifier que tes propres tâches")
+    # Les non-admins ne peuvent pas changer l'assignation ni le projet
+    if u.role != "admin":
+        data.pop("assignee_id", None)
+        data.pop("project_id", None)
+    for k in ("title", "description", "priority", "status"):
+        if k in data: setattr(t, k, data[k])
+    if "progress" in data: t.progress = int(data["progress"])
+    if "start_date" in data: t.start_date = _parse_date(data["start_date"])
+    if "due_date" in data: t.due_date = _parse_date(data["due_date"])
+    if "assignee_id" in data: t.assignee_id = data["assignee_id"]
+    if "project_id" in data and s.get(Project, data["project_id"]): t.project_id = data["project_id"]
+    if t.status == "done": t.progress = 100
+    s.add(t); s.commit()
+    # toute mise à jour invalide les acquittements liés à cette tâche
+    for ack in s.exec(select(AckedAlert).where(AckedAlert.alert_key.endswith(f":{tid}"))).all():
+        s.delete(ack)
+    s.commit()
+    return task_dict(t)
+
+@app.delete("/api/tasks/{tid}")
+def delete_task(tid: int, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    t = s.get(Task, tid)
+    if t:
+        if not _can_edit_task(u, t):
+            raise HTTPException(403, "Tu ne peux supprimer que tes propres tâches")
+        s.delete(t); s.commit()
+    return {"ok": True}
+
+# ---------------- API : Absences ----------------
+@app.get("/api/absences")
+def list_absences(u: User = Depends(require_user), s: Session = Depends(get_session)):
+    return [{"id": a.id, "user_id": a.user_id, "kind": a.kind,
+             "from_date": a.from_date.isoformat(), "to_date": a.to_date.isoformat()}
+            for a in s.exec(select(Absence).order_by(Absence.from_date.desc())).all()]
+
+@app.post("/api/absences")
+def create_absence(data: dict, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    uid = data.get("user_id") or u.id
+    # Non-admin : ne peut déclarer que pour soi-même
+    if u.role != "admin": uid = u.id
+    a = Absence(user_id=uid, kind=data.get("kind", "Congé"),
+                from_date=_parse_date(data["from_date"]),
+                to_date=_parse_date(data["to_date"]))
+    if a.to_date < a.from_date:
+        raise HTTPException(400, "La date de fin doit suivre la date de début")
+    s.add(a); s.commit(); s.refresh(a)
+    return {"id": a.id}
+
+@app.delete("/api/absences/{aid}")
+def delete_absence(aid: int, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    a = s.get(Absence, aid)
+    if a:
+        if u.role != "admin" and a.user_id != u.id:
+            raise HTTPException(403)
+        s.delete(a); s.commit()
+    return {"ok": True}
+
+# ---------------- API : Alerts ----------------
+@app.get("/api/alerts")
+def get_alerts(project_id: Optional[int] = None,
+               u: User = Depends(require_user), s: Session = Depends(get_session)):
+    today = date.today()
+    q = select(Task)
+    if project_id is not None:
+        q = q.where(Task.project_id == project_id)
+    tasks = s.exec(q).all()
+    users = {x.id: x for x in s.exec(select(User)).all()}
+    absences = s.exec(select(Absence)).all()
+    acked_keys = {a.alert_key for a in s.exec(select(AckedAlert)).all()}
+    def is_absent_now(uid):
+        return any(a.user_id == uid and a.from_date <= today <= a.to_date for a in absences)
+    out = []
+    for t in tasks:
+        assignee = users.get(t.assignee_id) if t.assignee_id else None
+        aname = assignee.name if assignee else "Non assigné"
+        if t.status != "done" and t.due_date and t.due_date < today:
+            d = (today - t.due_date).days
+            key = f"late:{t.id}"
+            if key not in acked_keys:
+                out.append({"key": key, "kind": "late", "task_id": t.id, "type": "bad",
+                            "title": f"Retard : {t.title}",
+                            "msg": f"En retard de {d} jour(s). Assigné à {aname}.",
+                            "assignee_email": assignee.email if assignee else None})
+        elif t.status != "done" and t.due_date:
+            d = (t.due_date - today).days
+            if 0 <= d <= 2:
+                key = f"soon:{t.id}"
+                if key not in acked_keys:
+                    out.append({"key": key, "kind": "soon", "task_id": t.id, "type": "warn",
+                                "title": f"Échéance proche : {t.title}",
+                                "msg": f"À rendre dans {d} jour(s) — {aname}.",
+                                "assignee_email": assignee.email if assignee else None})
+        if t.status != "done" and t.assignee_id and is_absent_now(t.assignee_id):
+            key = f"absent:{t.id}"
+            if key not in acked_keys:
+                out.append({"key": key, "kind": "absent", "task_id": t.id, "type": "info",
+                            "title": f"Personne absente : {t.title}",
+                            "msg": f"{aname} est absent(e) aujourd'hui mais a une tâche active.",
+                            "assignee_email": assignee.email if assignee else None})
+    return out
+
+@app.post("/api/alerts/ack")
+def ack_alert(data: dict, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    key = data.get("key")
+    if not key: raise HTTPException(400)
+    if not s.exec(select(AckedAlert).where(AckedAlert.alert_key == key)).first():
+        s.add(AckedAlert(alert_key=key)); s.commit()
+    return {"ok": True}
+
+@app.post("/api/alerts/ack_all")
+def ack_all(u: User = Depends(require_user), s: Session = Depends(get_session)):
+    alerts = get_alerts(None, u, s)
+    existing = {a.alert_key for a in s.exec(select(AckedAlert)).all()}
+    for a in alerts:
+        if a["key"] not in existing:
+            s.add(AckedAlert(alert_key=a["key"]))
+    s.commit()
+    return {"ok": True, "count": len(alerts)}
+
+# ---------------- API : Settings (branding) ----------------
+@app.get("/api/settings")
+def get_settings(s: Session = Depends(get_session)):
+    return {"app_name": _setting(s, "app_name", "Atelier"),
+            "app_logo": _setting(s, "app_logo", "")}
+
+@app.put("/api/settings")
+def update_settings(data: dict, u: User = Depends(require_admin), s: Session = Depends(get_session)):
+    if "app_name" in data: _set_setting(s, "app_name", data["app_name"].strip() or "Atelier")
+    if "app_logo" in data: _set_setting(s, "app_logo", data["app_logo"])
+    return {"ok": True}
+
+# ---------------- API : Document Import ----------------
+@app.post("/api/parse-document")
+async def parse_document(file: UploadFile = File(...), u: User = Depends(require_user)):
+    """Extrait le texte d'un PDF/DOCX/TXT et le renvoie pour analyse côté navigateur."""
+    name = file.filename.lower()
+    content = await file.read()
+    text = ""
+    try:
+        if name.endswith(".txt") or name.endswith(".md"):
+            text = content.decode("utf-8", errors="ignore")
+        elif name.endswith(".docx"):
+            from docx import Document
+            doc = Document(io.BytesIO(content))
+            text = "\n".join(p.text for p in doc.paragraphs)
+        elif name.endswith(".pdf"):
+            from pypdf import PdfReader
+            r = PdfReader(io.BytesIO(content))
+            text = "\n".join(p.extract_text() or "" for p in r.pages)
+        else:
+            raise HTTPException(400, "Format non supporté (PDF, DOCX, TXT seulement)")
+    except Exception as e:
+        raise HTTPException(400, f"Lecture impossible : {e}")
+    return {"text": text}

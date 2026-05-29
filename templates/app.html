@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ app_name }}</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="logo {% if is_admin %}editable{% endif %}" id="appLogo" title="{% if is_admin %}Cliquer pour changer{% endif %}">
+      {% if app_logo %}<img src="{{ app_logo }}" alt="logo">{% else %}{{ app_name[0]|upper }}{% endif %}
+    </div>
+    {% if is_admin %}<input type="file" id="logoInput" accept="image/*" class="hidden">{% endif %}
+    <div>
+      <h1 id="appName" class="{% if is_admin %}editable{% endif %}" title="{% if is_admin %}Cliquer pour renommer{% endif %}">{{ app_name }}</h1>
+      <span>Gestion de projet</span>
+    </div>
+  </div>
+  <div class="toolbar">
+    <div class="user-chip">
+      <div class="ava" id="meAva"></div>
+      <span>{{ user.name }}</span>
+      {% if is_admin %}<span class="role-tag">ADMIN</span>{% endif %}
+    </div>
+    <button class="btn ghost" id="btnImportDoc">📄 Importer un document</button>
+    <input type="file" id="docInput" accept=".pdf,.docx,.txt,.md" class="hidden">
+    <a href="/logout" class="btn ghost">Déconnexion</a>
+  </div>
+</header>
+
+<nav>
+  <div class="tab active" data-tab="dash">Tableau de bord</div>
+  <div class="tab" data-tab="synth">Synthèse projet</div>
+  <div class="tab" data-tab="tasks">Tâches</div>
+  <div class="tab" data-tab="team">Équipe</div>
+  <div class="tab" data-tab="absence">Absences</div>
+  <div class="tab" data-tab="alerts">Alertes <span class="badge hidden" id="alertBadge">0</span></div>
+</nav>
+
+<div class="projbar">
+  <label>Projet :</label>
+  <select id="projSelect"></select>
+  {% if is_admin %}
+  <button class="btn sm" id="btnAddProj">+ Nouveau projet</button>
+  <button class="btn sm ghost" id="btnEditProj">Renommer</button>
+  <button class="btn sm ghost" id="btnDelProj">Supprimer</button>
+  {% endif %}
+</div>
+
+<main>
+  <section id="sec-dash">
+    <div class="grid stats" id="statRow"></div>
+    <div class="grid" style="grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);align-items:start">
+      <div class="panel"><div class="sec-h"><h2>Avancement par tâche</h2></div><div id="dashProgress"></div></div>
+      <div class="panel"><div class="sec-h"><h2>Alertes actives</h2></div><div class="grid" id="dashAlerts" style="gap:11px"></div></div>
+    </div>
+  </section>
+
+  <section id="sec-synth" class="hidden">
+    <div class="sec-h">
+      <h2 id="synthTitle">Synthèse du projet</h2>
+      <button class="btn primary" id="btnExportPDF">⬇ Exporter en PDF</button>
+    </div>
+    <div id="synthContent"></div>
+  </section>
+
+  <section id="sec-tasks" class="hidden">
+    <div class="sec-h">
+      <h2>Tâches du projet</h2>
+      <div class="row">
+        <select class="btn sm" id="filterStatus">
+          <option value="all">Tous les statuts</option>
+          <option value="todo">À faire</option>
+          <option value="prog">En cours</option>
+          <option value="done">Terminé</option>
+        </select>
+        <button class="btn primary" id="btnAddTask">+ Nouvelle tâche</button>
+      </div>
+    </div>
+    {% if not is_admin %}
+    <p class="locked-hint">ℹ Tu ne peux modifier que les tâches qui te sont assignées. Une nouvelle tâche te sera automatiquement attribuée.</p>
+    {% endif %}
+    <div class="grid cards" id="taskList"></div>
+  </section>
+
+  <section id="sec-team" class="hidden">
+    <div class="sec-h">
+      <h2>Équipe</h2>
+      {% if is_admin %}<button class="btn primary" id="btnAddPerson">+ Ajouter une personne</button>{% endif %}
+    </div>
+    <div class="grid cards" id="teamList"></div>
+  </section>
+
+  <section id="sec-absence" class="hidden">
+    <div class="sec-h"><h2>Absences & congés</h2>
+      <button class="btn primary" id="btnAddAbs">+ Déclarer une absence</button>
+    </div>
+    <div class="panel" style="overflow:auto"><table>
+      <thead><tr><th>Personne</th><th>Type</th><th>Du</th><th>Au</th><th>Statut</th><th></th></tr></thead>
+      <tbody id="absList"></tbody>
+    </table></div>
+  </section>
+
+  <section id="sec-alerts" class="hidden">
+    <div class="sec-h"><h2>Centre d'alertes</h2><button class="btn sm ghost hidden" id="btnAckAll">✓ Tout acquitter</button></div>
+    <div class="grid" id="alertList" style="gap:11px"></div>
+  </section>
+</main>
+
+<!-- MODALES -->
+<div class="modal-bg" id="taskModal"><div class="modal">
+  <h2 id="taskModalTitle">Nouvelle tâche</h2>
+  <input type="hidden" id="f_taskId">
+  <div class="field"><label>Titre</label><input id="f_title" placeholder="Ex : Maquette page d'accueil"></div>
+  <div class="field"><label>Description</label><textarea id="f_desc" rows="2"></textarea></div>
+  <div class="row" style="gap:13px">
+    <div class="field" style="flex:1;min-width:140px"><label>Assigné à</label><select id="f_assignee"></select></div>
+    <div class="field" style="flex:1;min-width:140px"><label>Priorité</label>
+      <select id="f_prio"><option value="h">Haute</option><option value="m" selected>Moyenne</option><option value="l">Basse</option></select></div>
+  </div>
+  <div class="row" style="gap:13px">
+    <div class="field" style="flex:1;min-width:140px"><label>Début</label><input type="date" id="f_start"></div>
+    <div class="field" style="flex:1;min-width:140px"><label>Échéance</label><input type="date" id="f_due"></div>
+  </div>
+  <div class="row" style="gap:13px">
+    <div class="field" style="flex:1;min-width:140px"><label>Statut</label>
+      <select id="f_status"><option value="todo">À faire</option><option value="prog">En cours</option><option value="done">Terminé</option></select></div>
+    <div class="field" style="flex:1;min-width:140px"><label>Avancement : <span id="f_progVal">0</span>%</label><input type="range" id="f_prog" min="0" max="100" value="0"></div>
+  </div>
+  <div class="row" style="justify-content:flex-end;margin-top:8px">
+    <button class="btn ghost" data-close="taskModal">Annuler</button>
+    <button class="btn primary" id="btnSaveTask">Enregistrer</button>
+  </div>
+</div></div>
+
+<div class="modal-bg" id="personModal"><div class="modal">
+  <h2 id="personModalTitle">Ajouter une personne</h2>
+  <input type="hidden" id="f_personId">
+  <div class="field"><label>Nom complet</label><input id="f_name" placeholder="Ex : Camille Roche"></div>
+  <div class="field"><label>Email</label><input id="f_email" placeholder="camille@exemple.fr"></div>
+  <div class="field" id="passwordField"><label>Mot de passe (laisser vide pour générer automatiquement)</label><input id="f_password" type="text"></div>
+  <div class="field"><label>Rôle dans l'application</label>
+    <select id="f_role"><option value="user">Utilisateur (modifie ses tâches uniquement)</option><option value="admin">Administrateur (accès total)</option></select>
+  </div>
+  <div class="row" style="justify-content:flex-end;margin-top:8px">
+    <button class="btn ghost" data-close="personModal">Annuler</button>
+    <button class="btn primary" id="btnSavePerson">Enregistrer</button>
+  </div>
+</div></div>
+
+<div class="modal-bg" id="absModal"><div class="modal">
+  <h2>Déclarer une absence</h2>
+  <div class="field"><label>Personne</label><select id="f_aPerson"></select></div>
+  <div class="field"><label>Type</label>
+    <select id="f_aType"><option>Congé payé</option><option>Maladie</option><option>Télétravail</option><option>Formation</option><option>Autre</option></select></div>
+  <div class="row" style="gap:13px">
+    <div class="field" style="flex:1;min-width:140px"><label>Du</label><input type="date" id="f_aFrom"></div>
+    <div class="field" style="flex:1;min-width:140px"><label>Au</label><input type="date" id="f_aTo"></div>
+  </div>
+  <div class="row" style="justify-content:flex-end;margin-top:8px">
+    <button class="btn ghost" data-close="absModal">Annuler</button>
+    <button class="btn primary" id="btnSaveAbs">Enregistrer</button>
+  </div>
+</div></div>
+
+<div class="modal-bg" id="docModal"><div class="modal wide">
+  <h2 id="docModalTitle">Analyse du document</h2>
+  <div id="docBody"></div>
+  <div class="row" style="justify-content:flex-end;margin-top:14px" id="docActions"></div>
+</div></div>
+
+<script>
+window.CURRENT_USER = {
+  id: {{ user.id }}, name: {{ user.name|tojson }}, role: {{ user.role|tojson }},
+  is_admin: {{ 'true' if is_admin else 'false' }}
+};
+</script>
+<script src="/static/app.js"></script>
+</body>
+</html>
