@@ -70,6 +70,20 @@ class AckedAlert(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     alert_key: str = Field(index=True)  # ex: "late:42" — task_id concerné
 
+class SubTask(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: int = Field(index=True)
+    title: str
+    done: bool = Field(default=False)
+    position: int = Field(default=0)
+
+class Comment(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: int = Field(index=True)
+    user_id: int
+    text: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
 class Setting(SQLModel, table=True):
     key: str = Field(primary_key=True)
     value: str
@@ -368,6 +382,80 @@ def delete_task(tid: int, u: User = Depends(require_user), s: Session = Depends(
             raise HTTPException(403, "Tu ne peux supprimer que tes propres tâches")
         s.delete(t); s.commit()
     return {"ok": True}
+
+# ---------------- API : Sous-tâches ----------------
+@app.get("/api/tasks/{tid}/subtasks")
+def list_subtasks(tid: int, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    return [{"id": st.id, "title": st.title, "done": st.done, "position": st.position}
+            for st in s.exec(select(SubTask).where(SubTask.task_id == tid).order_by(SubTask.position)).all()]
+
+@app.post("/api/tasks/{tid}/subtasks")
+def create_subtask(tid: int, data: dict, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    t = s.get(Task, tid)
+    if not t: raise HTTPException(404)
+    if not _can_edit_task(u, t): raise HTTPException(403)
+    title = data.get("title", "").strip()
+    if not title: raise HTTPException(400, "Titre requis")
+    pos = s.exec(select(SubTask).where(SubTask.task_id == tid)).all()
+    st = SubTask(task_id=tid, title=title, position=len(pos))
+    s.add(st); s.commit(); s.refresh(st)
+    return {"id": st.id, "title": st.title, "done": st.done, "position": st.position}
+
+@app.put("/api/subtasks/{sid}")
+def update_subtask(sid: int, data: dict, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    st = s.get(SubTask, sid)
+    if not st: raise HTTPException(404)
+    t = s.get(Task, st.task_id)
+    if not _can_edit_task(u, t): raise HTTPException(403)
+    if "title" in data: st.title = data["title"].strip()
+    if "done" in data: st.done = bool(data["done"])
+    s.add(st); s.commit()
+    return {"ok": True}
+
+@app.delete("/api/subtasks/{sid}")
+def delete_subtask(sid: int, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    st = s.get(SubTask, sid)
+    if st:
+        t = s.get(Task, st.task_id)
+        if not _can_edit_task(u, t): raise HTTPException(403)
+        s.delete(st); s.commit()
+    return {"ok": True}
+
+# ---------------- API : Commentaires ----------------
+@app.get("/api/tasks/{tid}/comments")
+def list_comments(tid: int, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    users = {x.id: x.name for x in s.exec(select(User)).all()}
+    return [{"id": c.id, "user_id": c.user_id, "author": users.get(c.user_id, "?"),
+             "text": c.text, "created_at": c.created_at.isoformat()}
+            for c in s.exec(select(Comment).where(Comment.task_id == tid).order_by(Comment.created_at)).all()]
+
+@app.post("/api/tasks/{tid}/comments")
+def create_comment(tid: int, data: dict, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    if not s.get(Task, tid): raise HTTPException(404)
+    text = data.get("text", "").strip()
+    if not text: raise HTTPException(400, "Texte requis")
+    c = Comment(task_id=tid, user_id=u.id, text=text)
+    s.add(c); s.commit(); s.refresh(c)
+    return {"id": c.id, "author": u.name, "text": c.text, "created_at": c.created_at.isoformat()}
+
+@app.delete("/api/comments/{cid}")
+def delete_comment(cid: int, u: User = Depends(require_user), s: Session = Depends(get_session)):
+    c = s.get(Comment, cid)
+    if c:
+        if u.role != "admin" and c.user_id != u.id: raise HTTPException(403)
+        s.delete(c); s.commit()
+    return {"ok": True}
+
+# ---------------- API : Recherche ----------------
+@app.get("/api/search")
+def search_api(q: str = "", u: User = Depends(require_user), s: Session = Depends(get_session)):
+    if not q.strip() or len(q.strip()) < 2: return {"tasks": [], "projects": []}
+    ql = q.strip().lower()
+    tasks = [task_dict(t) for t in s.exec(select(Task)).all()
+             if ql in t.title.lower() or ql in (t.description or "").lower()][:15]
+    projects = [{"id": p.id, "name": p.name} for p in s.exec(select(Project)).all()
+                if ql in p.name.lower()][:5]
+    return {"tasks": tasks, "projects": projects}
 
 # ---------------- API : Absences ----------------
 @app.get("/api/absences")
