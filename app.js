@@ -74,6 +74,7 @@ function renderAll(){
   renderTeam();
   renderAbsences();
   renderAlerts();
+  renderKanban();
 }
 
 function renderProjBar(){
@@ -126,12 +127,12 @@ function renderTasks(){
   const list=projTasks().filter(t=>state.filterStatus==='all'||t.status===state.filterStatus);
   const el=$('taskList');
   if(list.length===0){el.innerHTML='<div class="empty">Aucune tâche. Clique sur « Nouvelle tâche ».</div>';return;}
-  el.innerHTML = list.map(t=>{
+  el.innerHTML = list.map((t,i)=>{
     const late=isLate(t), st=late?'late':t.status, lbl=late?'En retard':STATUS_LABEL[t.status];
     const assignee=userById(t.assignee_id);
     const canRemind=late && assignee && assignee.email;
     const canEdit=canEditTask(t);
-    return `<div class="card"><div class="bar" style="background:${late?'var(--bad)':STATUS_COLOR[t.status]}"></div>
+    return `<div class="card" style="animation-delay:${i*35}ms"><div class="bar" style="background:${late?'var(--bad)':STATUS_COLOR[t.status]}"></div>
       <div class="row" style="justify-content:space-between"><span class="tag ${st}">${lbl}</span><span class="prio ${t.priority}">● ${PRIO_LABEL[t.priority]}</span></div>
       <h3 style="margin-top:8px">${esc(t.title)}</h3>${t.description?`<div class="meta">${esc(t.description)}</div>`:''}
       <div class="meta">👤 ${esc(userName(t.assignee_id))}${isAbsentNow(t.assignee_id)?' <span class="pill absent">absent</span>':''}</div>
@@ -238,6 +239,85 @@ function buildGantt(ts){
   return `<div class="gantt">${head}${rows}</div>`;
 }
 
+/* ====== Kanban ====== */
+const KANBAN_COLS=[
+  {status:'todo',label:'À faire',cls:'todo'},
+  {status:'prog',label:'En cours',cls:'prog'},
+  {status:'done',label:'Terminé',cls:'done'}
+];
+
+function renderKanban(){
+  const board=$('kanbanBoard');
+  if(!board)return;
+  const ts=projTasks();
+  board.innerHTML='<div class="kanban-board">'+KANBAN_COLS.map(col=>{
+    const tasks=ts.filter(t=>t.status===col.status);
+    const cards=tasks.length?tasks.map(t=>{
+      const u=userById(t.assignee_id);
+      const late=isLate(t);
+      const barColor=late?'var(--bad)':col.status==='done'?'var(--ok)':col.status==='prog'?'var(--info)':'var(--mut)';
+      return `<div class="kanban-card${late?' late':''}" data-id="${t.id}">
+        <div class="kanban-card-bar" style="background:${barColor}"></div>
+        <div class="row" style="justify-content:space-between">
+          <span class="prio ${t.priority}">● ${PRIO_LABEL[t.priority]}</span>
+          ${late?'<span class="tag late" style="font-size:10px">Retard</span>':''}
+        </div>
+        <div class="kanban-card-title" data-edit-task="${t.id}">${esc(t.title)}</div>
+        <div class="kanban-card-meta">
+          <span>👤 ${esc(u?u.name:'Non assigné')}</span>
+          ${t.due_date?`<span>📅 ${fmtDate(t.due_date)}</span>`:''}
+        </div>
+        ${t.progress>0?`<div class="progress" style="margin-top:8px"><i style="width:${t.progress}%"></i></div>`:''}
+      </div>`;
+    }).join(''):`<div class="kanban-empty">Aucune tâche</div>`;
+    return `<div class="kanban-col">
+      <div class="kanban-col-header ${col.cls}">
+        <span class="kanban-col-title">${col.label}</span>
+        <span class="kanban-count" id="kanban-count-${col.status}">${tasks.length}</span>
+      </div>
+      <div class="kanban-col-body" id="kanban-col-${col.status}" data-status="${col.status}">${cards}</div>
+    </div>`;
+  }).join('')+'</div>';
+  if(typeof Sortable!=='undefined') initKanban();
+}
+
+function initKanban(){
+  KANBAN_COLS.forEach(col=>{
+    const el=$('kanban-col-'+col.status);
+    if(!el)return;
+    Sortable.create(el,{
+      group:'kanban',animation:180,
+      ghostClass:'kanban-ghost',chosenClass:'kanban-chosen',
+      onEnd:async function(evt){
+        const taskId=parseInt(evt.item.dataset.id,10);
+        const newStatus=evt.to.dataset.status;
+        const oldStatus=evt.from.dataset.status;
+        if(newStatus===oldStatus)return;
+        // Mise à jour optimiste des compteurs
+        KANBAN_COLS.forEach(c=>{
+          const body=$('kanban-col-'+c.status);
+          const count=$('kanban-count-'+c.status);
+          if(body&&count) count.textContent=body.querySelectorAll('.kanban-card').length;
+        });
+        // Update state local
+        const task=state.tasks.find(t=>t.id===taskId);
+        const prevStatus=oldStatus;
+        if(task) task.status=newStatus;
+        try{
+          await api('/api/tasks/'+taskId,{method:'PUT',body:{status:newStatus}});
+          if(task&&newStatus==='done') task.progress=100;
+          renderStats();renderDash();
+        }catch(e){
+          // Rollback
+          if(task) task.status=prevStatus;
+          alert('Erreur lors du déplacement : '+e.message);
+          renderKanban();
+        }
+      }
+    });
+  });
+}
+
 /* ====== Rappel par personne ====== */
 async function remindPerson(userId){
   const u=userById(userId);
@@ -286,7 +366,17 @@ function remindTask(taskId){
 /* ====== Navigation ====== */
 function tab(name){
   document.querySelectorAll('nav .tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
-  ['dash','synth','tasks','team','absence','alerts'].forEach(s=>$('sec-'+s).classList.toggle('hidden',s!==name));
+  ['dash','synth','tasks','team','absence','alerts','kanban'].forEach(s=>{
+    const el=$('sec-'+s);
+    if(s===name){
+      el.classList.remove('hidden');
+      el.style.animation='none';
+      el.offsetHeight; // force reflow pour relancer l'animation
+      el.style.animation='';
+    }else{
+      el.classList.add('hidden');
+    }
+  });
 }
 function openModal(id){fillSelects();$(id).classList.add('show');}
 function closeModal(id){$(id).classList.remove('show');}
